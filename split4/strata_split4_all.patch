@@ -1,0 +1,1164 @@
+diff --git a/src/split/CMakeLists.txt b/src/split/CMakeLists.txt
+index 21998ed79..7e807062e 100644
+--- a/src/split/CMakeLists.txt
++++ b/src/split/CMakeLists.txt
+@@ -68,9 +68,7 @@ set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
+ set(_sp_engine
+     ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu
+     ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
+-if(_fnx_hip)
+-  list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
+-endif()
++list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp, arch_caps.hpp)
+ if(_fnx_hip)
+   set(_fnx_lang HIP)
+ else()
+@@ -143,9 +141,9 @@ foreach(_n ${STRATA_SPLIT_CARDS})
+   set_target_properties(${_t} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+ endforeach()
+ 
+-# the engine's kernel self-test on one card, with no model and no engine start (cleanup 4.4; tools/selftest_main.cpp).  HIP only, off by default
+-# (EXCLUDE_FROM_ALL: built by name).  The engine runs the same src/selftest.cu before it loads a model on a card Strata has not run the split on;
+-# this is the way to ask a card that question alone:
++# the engine's kernel self-test on one card, with no model and no engine start (cleanup 4.4; tools/selftest_main.cpp).  Off by default, built by name.
++# The engine runs the same src/selftest.cu before it loads a model on a card Strata has not run the split on (both sides: HIP and CUDA); this is the way to
++# ask a card that question alone:
+ #   cmake --build <dir> --target strata-split-selftest && <dir>/src/split/strata-split-selftest [device]     (exit 0: every test passed)
+ if(_fnx_hip)
+   list(GET STRATA_SPLIT_CARDS 0 _nst)
+@@ -158,12 +156,28 @@ if(_fnx_hip)
+   target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
+   target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+   set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
++else()
++  # CUDA: the same question on an NVIDIA card, built for the same architecture the engine targets.  This is what makes a
++  # card nobody has run the split on a measurement instead of a guess: 20 seconds, no model, no four-card setup.
++  list(GET STRATA_SPLIT_CARDS 0 _nst)
++  set(_t strata-split-selftest)
++  add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu ${_sp_kparts})
++  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda
++                             ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/include)
++  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1
++                             FNX_PF_JOB=${STRATA_SPLIT_PF_JOB} FNX_DIR="${_sp}")
++  target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
++  set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
++                        CXX_STANDARD 17 CUDA_RUNTIME_LIBRARY Shared)
++  find_package(Threads REQUIRED)
++  find_package(CUDAToolkit REQUIRED)
++  target_link_libraries(${_t} PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver Threads::Threads)
+ endif()
+ 
+ # the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
+ if(STRATA_BUILD_TESTS)
+   list(GET STRATA_SPLIT_CARDS 0 _n0)
+-  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test)
++  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test arch_caps_test)
+     add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
+     target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
+     target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)
+diff --git a/src/split/src/arch_caps.hpp b/src/split/src/arch_caps.hpp
+new file mode 100644
+index 000000000..cde7e072b
+--- /dev/null
++++ b/src/split/src/arch_caps.hpp
+@@ -0,0 +1,94 @@
++#pragma once
++// What a CUDA compute capability brings, in one table instead of `#if FNX_ARCH >= 80` spread over the kernels: the
++// shared memory a block may opt into, whether the four-way int8 dot product exists, which f16 mma the tree uses, and
++// which architectures Strata has actually run this engine on. CPU-only, so tools/arch_caps_test.cpp can hold the
++// numbers without a card: a machine nobody has tried gets an answer in words before a three-minute model load ends
++// in a kernel error.
++//
++// The per-block dynamic shared memory is the limit that decides kernel layouts. Published values (CUDA Programming
++// Guide, "Memory Information" table and its footnote): 7.0 Volta 96 KiB, 7.5 Turing 64 KiB, 8.0 163 KiB, 8.6 and
++// 8.9 99 KiB, 8.7 163 KiB, 9.0 227 KiB, 10.0/10.3/11.0 227 KiB, 12.x 99 KiB. Anything unlisted takes the floor:
++// asking a card for more than it has fails the launch, and the smaller kernel layout is correct either way, only
++// slower (the HIP build has always used the 16-column layout against the CUDA build's 32 and its results are
++// bit-identical, hip/selftest_policy.hpp).
++#include <cstdlib>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace fnx {
++
++// what an unlisted capability is assumed to have, so a new card is never given a bigger kernel than it can run
++constexpr int SMEM_FLOOR_KIB = 64;
++
++constexpr int smem_per_block_kib(int cc) {
++    return cc == 70 ? 96                       // Volta
++         : cc == 75 ? 64                       // Turing (2080, 3090, T4)
++         : (cc == 80 || cc == 87) ? 163       // A100/A800 class
++         : (cc == 86 || cc == 89) ? 99        // GA10x (A4000, A5000, 3090) and Ada
++         : cc >= 90 && cc < 120 ? 227         // Hopper and data-center Blackwell
++         : cc >= 120 && cc < 130 ? 99        // consumer Blackwell (RTX 50xx, RTX PRO 6000)
++         : SMEM_FLOOR_KIB;
++}
++constexpr int smem_per_block(int cc) { return smem_per_block_kib(cc) * 1024; }
++
++// the four-way int8 dot product (ggml's decode readers, the IQ2/IQ4 types): sm_61 and newer
++constexpr bool has_dp4a(int cc) { return cc >= 61; }
++// the Ampere-style f16 mma (m16n8k16) that the tree's `FNX_ARCH >= 80` kernels are laid out for; below it the
++// m8n8k4 path runs (src/split/src/moe_mma.cuh, laid out for 64-row jobs)
++constexpr bool has_mma_16816(int cc) { return cc >= 80; }
++// the INT8 tensor-core attention tile and the tensor-core GDN prompt kernel (attn_prompt_i8.cuh, gdn_tc_prompt.cuh):
++// compiled for these cards only, below them the f16 kernels run
++constexpr bool has_i8_attention(int cc) { return cc >= 80; }
++
++// The architectures Strata has run the all-cards split on (strata_control/split_engine.py keeps the matching TESTED
++// table for the card counts): sm_86 (2x RTX A6000, the 61-task suite, pictures, hashes) and sm_120 (2x RTX PRO 6000).
++// Four cards on sm_86 was run and measured by this site on 2026-11-11; the engine still asks the self-test of a card
++// it has not run on, which is what makes a new architecture a question to measure instead of a guess.
++constexpr bool arch_run_by_strata(int cc) { return cc == 86 || cc == 120; }
++
++// one plain line about a card: what it can do, and what the engine therefore does with it
++inline std::string arch_note(int cc) {
++    std::string s = "sm_" + std::to_string(cc) + ": " + std::to_string(smem_per_block_kib(cc)) + " KiB shared memory a block";
++    s += has_dp4a(cc) ? ", dp4a yes" : ", dp4a NO (int8 experts would not run)";
++    s += has_mma_16816(cc) ? ", f16 mma 16816 yes" : ", f16 mma 16816 no (m8n8k4 path)";
++    s += has_i8_attention(cc) ? ", int8 attention path" : ", f16 attention path";
++    s += arch_run_by_strata(cc) ? ", run by Strata" : ", not run by Strata (the kernel self-test decides)";
++    return s;
++}
++
++// The NVIDIA-side mirror of hip/selftest_policy.hpp: on a card Strata has not run the split on, check the kernels
++// against a scalar reference before anything is loaded. FNX_SELFTEST=1 asks for it on a known card too (to see it
++// pass), FNX_SELFTEST=0 skips it (a tester who takes the risk), FNX_SELFTEST_FAIL=1 forces a failure (tests).
++struct NvSelftestDecision {
++    bool run = false;
++    bool ok = true;
++    std::vector<std::string> lines;
++};
++
++inline NvSelftestDecision nv_selftest_decide(int cc, const char* env_selftest, const char* env_fail,
++                                             const std::function<std::string(std::string&)>& run) {
++    NvSelftestDecision d;
++    const bool known = arch_run_by_strata(cc);
++    const bool forced = env_selftest && std::string(env_selftest) == "1";
++    if (known && !forced) return d;
++    if (env_selftest && std::string(env_selftest) == "0") return d;
++    const std::string arch = "sm_" + std::to_string(cc);
++    if (!known)
++        d.lines.push_back("The split engine is experimental on this card (" + arch + ", " + arch_note(cc) +
++                          "): Strata has not run it on this architecture. Please report whether it works.");
++    d.run = true;
++    std::string covered, bad;
++    if (env_fail && std::string(env_fail) == "1") bad = "forced failure (FNX_SELFTEST_FAIL=1)";
++    else bad = run(covered);
++    if (!bad.empty()) {
++        d.ok = false;
++        d.lines.push_back("The split engine's self-test failed on " + arch + " (" + bad +
++                          "), so it does not run on this card: the normal layer split starts instead.");
++        return d;
++    }
++    d.lines.push_back("The split engine's self-test passed on " + arch + " (" + covered + ").");
++    return d;
++}
++
++}  // namespace fnx
+diff --git a/src/split/src/gdn_prompt.cuh b/src/split/src/gdn_prompt.cuh
+index 745c7e87a..a24cb8bbc 100644
+--- a/src/split/src/gdn_prompt.cuh
++++ b/src/split/src/gdn_prompt.cuh
+@@ -163,13 +163,20 @@ __global__ void __launch_bounds__(GDN_PF_THREADS) k_gdn_pf_rec(const float* __re
+ // k_gdn_ch_prep makes what does not depend on the state for every sub-chunk and head at once (T, P, G, the decays to the
+ // end, b); k_gdn_ch_rec walks the sub-chunks in order per (value head, GCB columns), the state's columns in shared
+ // memory. The sums come in another order than k_gdn_core's, row by row (fp32 either way).
++constexpr int GCH = 32, GCH_THREADS = 256;
++// The state columns one block carries: 32 where the card's shared memory holds the 72.6 KiB that layout needs, 16
++// where it does not (Turing's 64 KiB a block, gfx12's 64 KiB LDS: 56.6 KiB, in 128 threads and twice the blocks a
++// head). Every output's sum runs in the same order either way, so this is a size question, not a numerical one -- the
++// HIP build has always used 16 against the CUDA build's 32 and its results are bit-identical. The card's limit comes
++// from arch_caps.hpp, so four Turing or four Blackwell cards get the layout they can launch instead of a
++// cudaFuncSetAttribute error three minutes into the model load.
++constexpr int gch_rec_floats(int gcb) { return 2 * GCH * (HS + 1) + HS * gcb + 4 * GCH * gcb + (2 * GCH * GCH + 3 * GCH + 1); }
+ #if FNX_HIP
+-// gfx12 has 64 KB of LDS a block: k_gdn_ch_rec takes 16 state columns (58 KB) in 128 threads, twice the blocks a head; every output's sum
+-// runs in the same order as with 32 columns, so the results are bit-identical to the CUDA build's layout
+-constexpr int GCH = 32, GCB = 16, GCH_THREADS = 256, GCR_THREADS = 128, GCH_REC_BLOCKS_PER_HEAD = HS / GCB;
++constexpr bool GCH_WIDE = false;   // (FNX_ARCH is a gfx number here; the 64 KB LDS above is gfx12's own figure)
+ #else
+-constexpr int GCH = 32, GCB = 32, GCH_THREADS = 256, GCR_THREADS = 256, GCH_REC_BLOCKS_PER_HEAD = HS / GCB;
++constexpr bool GCH_WIDE = gch_rec_floats(32) * (int) sizeof(float) <= fnx::smem_per_block(FNX_ARCH);
+ #endif
++constexpr int GCB = GCH_WIDE ? 32 : 16, GCR_THREADS = GCH_WIDE ? 256 : 128, GCH_REC_BLOCKS_PER_HEAD = HS / GCB;
+ constexpr int GCR_CG = GCB / 4;   // column groups of 4 in a block's columns
+ // the decays from sums of up to GCH logs: --use_fast_math makes expf __expf, whose error grows with the argument (2 +
+ // 1.16 |x| ulp), so these go through double, which fast math leaves exact
+@@ -252,6 +259,12 @@ __global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_prep(const float* __rest
+ }
+ 
+ constexpr size_t GCH_REC_SMEM = sizeof(float) * (2 * GCH * (HS + 1) + HS * GCB + 4 * GCH * GCB + GCH_PREP_FLOATS);
++#if !FNX_HIP
++// the choice above is checked here, so a card that cannot launch this kernel says so at compile time instead of in
++// cudaFuncSetAttribute after the model has been read (kernels.cu, ck_launch)
++static_assert(GCH_REC_SMEM <= (size_t) fnx::smem_per_block(FNX_ARCH),
++              "k_gdn_ch_rec asks a card for more shared memory than a block can opt into (src/arch_caps.hpp)");
++#endif
+ // a thread's share of a sub-chunk's inputs, fetched into registers while the sub-chunk before computes
+ constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_THREADS,
+               GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
+diff --git a/src/split/src/gguf.cpp b/src/split/src/gguf.cpp
+index bf3da9d6a..69ac0b02b 100644
+--- a/src/split/src/gguf.cpp
++++ b/src/split/src/gguf.cpp
+@@ -35,6 +35,8 @@ TypeInfo type_info(uint32_t t) {
+         case T_Q5_K: return {256, 176};
+         case T_Q6_K: return {256, 210};
+         case T_IQ4_NL: return {32, 18};
++        case T_IQ2_XXS: return {256, 66};   // ggml: f16 d + u16 qs[QK_K/8]  (2.0625 bpw)
++        case T_IQ2_XS: return {256, 74};    // ggml: f16 d + u16 qs[QK_K/8] + u8 scales[QK_K/32]  (2.3125 bpw)
+         case T_IQ3_XXS: return {256, 98};
+         case T_IQ3_S: return {256, 110};
+         case T_IQ2_S: return {256, 82};
+@@ -123,13 +125,13 @@ void Gguf::convert_small_tensors() {
+     if (!mixed) return;
+     for (auto& kv : tensors_) {
+         Tensor& t = kv.second;
+-        if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
+-            owned_.emplace_back();
++        const uint32_t want = conv::wanted_type(t.name);
++        if (t.type == T_Q2_0 && want == 0xFFFFFFFFu) {   // routed experts only: the same values as Q4_0 blocks.
++            owned_.emplace_back();                        // A shared expert in Q2_0 must NOT take this shortcut: it needs Q8_0.
+             conv::repack_q2_0_to_q4_0(t, owned_.back());
+             ++converted_;
+             continue;
+         }
+-        const uint32_t want = conv::wanted_type(t.name);
+         if (want == 0xFFFFFFFFu || want == t.type) continue;
+         owned_.emplace_back();
+         conv::convert(t, want, owned_.back());
+diff --git a/src/split/src/gguf.hpp b/src/split/src/gguf.hpp
+index 2bd5efec6..a0b200df2 100644
+--- a/src/split/src/gguf.hpp
++++ b/src/split/src/gguf.hpp
+@@ -22,7 +22,7 @@ namespace fnx {
+ 
+ enum GgmlType : uint32_t {
+     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8, T_Q8_1 = 9, T_Q2_K = 10,
+-    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
++    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
+     T_IQ4_XS = 23, T_BF16 = 30, T_Q2_0 = 42,   // 42: Strata's 64-value 2-bit blocks (not in llama.cpp)
+ };
+ 
+diff --git a/src/split/src/iq3s_tables.hpp b/src/split/src/iq3s_tables.hpp
+new file mode 100644
+index 000000000..c21fbce90
+--- /dev/null
++++ b/src/split/src/iq3s_tables.hpp
+@@ -0,0 +1,84 @@
++// strata-split: die ggml-Tabellen, die tensor_convert.hpp fuer die IQ3_S-Umwandlung braucht.
++// Erzeugt aus third_party/strata-ggml/ggml/src/ggml-common.h (GGML_TABLE-Blöcke, Werte unveraendert).
++// Der Engine-Zweig binnt nicht ggmls CPU-Bibliothek, deshalb stehen die Tabellen hier.
++#pragma once
++
++#include <cstdint>
++
++namespace fnx {
++namespace conv {
++
++// kmask_iq2xs: 8 Werte, uebernommen aus ggml-common.h (Typ uint8_t)
++static const uint8_t kmask_iq2xs[8] = {
++    1, 2, 4, 8, 16, 32, 64, 128,
++};
++
++// iq3s_grid: 512 Werte, uebernommen aus ggml-common.h (Typ uint32_t)
++static const uint32_t iq3s_grid[512] = {
++    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
++    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
++    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
++    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
++    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
++    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
++    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
++    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
++    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
++    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
++    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
++    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
++    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
++    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
++    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
++    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
++    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
++    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
++    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
++    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
++    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
++    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
++    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
++    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
++    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
++    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
++    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
++    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
++    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
++    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
++    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
++    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
++    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
++    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
++    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
++    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
++    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
++    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
++    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
++    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
++    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
++    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
++    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
++    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
++    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
++    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
++    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
++    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
++    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
++    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
++    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
++    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
++    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
++    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
++    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
++    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
++    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
++    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
++    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
++    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
++    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
++    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
++    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
++    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
++};
++}  // namespace conv
++}  // namespace fnx
+diff --git a/src/split/src/kernels.cu b/src/split/src/kernels.cu
+index 36f8d3dc0..05db962b2 100644
+--- a/src/split/src/kernels.cu
++++ b/src/split/src/kernels.cu
+@@ -137,6 +137,13 @@ template <GgmlType type> __device__ __forceinline__ float vdot(const void* v, co
+     else if constexpr (type == T_IQ2_S) return fnx_vec_dot_iq2_s_q8_1(v, y, kbx, iqs);
+ #else
+     else if constexpr (type == T_IQ2_S) return vec_dot_iq2_s_q8_1(v, y, kbx, iqs);
++#endif
++#if FNX_HIP
++    // iqdot_hip.cuh carries no IQ2_XS/IQ2_XXS variant: a HIP build must never route these experts (delta4, CUDA only)
++    else if constexpr (type == T_IQ2_XS || type == T_IQ2_XXS) static_assert(type != T_IQ2_XS, "IQ2_XS/IQ2_XXS dots: CUDA only in this tree");
++#else
++    else if constexpr (type == T_IQ2_XS) return vec_dot_iq2_xs_q8_1(v, y, kbx, iqs);
++    else if constexpr (type == T_IQ2_XXS) return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs);
+ #endif
+     else return 0.0f;
+ }
+@@ -151,6 +158,8 @@ template <GgmlType type> constexpr int vdr_of() {
+     else if constexpr (type == T_IQ4_XS) return VDR_IQ4_XS;
+     else if constexpr (type == T_IQ3_S) return VDR_IQ3_S;
+     else if constexpr (type == T_IQ3_XXS) return VDR_IQ3_XXS;
++    else if constexpr (type == T_IQ2_XS) return VDR_IQ2_XS;
++    else if constexpr (type == T_IQ2_XXS) return VDR_IQ2_XXS;
+     else return VDR_IQ2_S;
+ }
+ 
+@@ -2176,6 +2185,8 @@ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs
+         case T_IQ3_S: moe_launch<T_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+         case T_IQ3_XXS: moe_launch<T_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+         case T_IQ2_S: moe_launch<T_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
++        case T_IQ2_XS: moe_launch<T_IQ2_XS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
++        case T_IQ2_XXS: moe_launch<T_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+         default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
+     }
+     ck_launch(down ? "moe_down" : "moe_gate_up");
+@@ -2224,6 +2235,8 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int
+         case T_IQ3_S: gu_sd_launch<T_IQ3_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+         case T_IQ3_XXS: gu_sd_launch<T_IQ3_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+         case T_IQ2_S: gu_sd_launch<T_IQ2_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++        case T_IQ2_XS: gu_sd_launch<T_IQ2_XS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++        case T_IQ2_XXS: gu_sd_launch<T_IQ2_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+         default: throw std::runtime_error("moe_gate_up: the shared expert rides in the launch of expert type " + std::to_string(A.type) + " only for the types moe_mm handles");
+     }
+     ck_launch("moe_gate_up (with the shared expert)");
+@@ -2251,6 +2264,8 @@ void moe_mm_big(bool down, const DW& A, size_t sa, const BigJob* jobs, const int
+         case T_IQ3_S: moe_launch_big<T_IQ3_S>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+         case T_IQ3_XXS: moe_launch_big<T_IQ3_XXS>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+         case T_IQ2_S: moe_launch_big<T_IQ2_S>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
++        case T_IQ2_XS: moe_launch_big<T_IQ2_XS>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
++        case T_IQ2_XXS: moe_launch_big<T_IQ2_XXS>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+         default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
+     }
+     ck_launch(down ? "moe_down (big jobs)" : "moe_gate_up (big jobs)");
+diff --git a/src/split/src/model.cpp b/src/split/src/model.cpp
+index b5dc85450..01009ebc5 100644
+--- a/src/split/src/model.cpp
++++ b/src/split/src/model.cpp
+@@ -6,9 +6,9 @@
+ #include "rope_gguf.hpp"
+ 
+ #include "store.hpp"
++#include "selftest.hpp"   // the kernel self-test of a card: rules and lines in hip/selftest_policy.hpp (AMD) or arch_caps.hpp (NVIDIA)
+ #if FNX_HIP
+ #include "hip/selftest_policy.hpp"
+-#include "selftest.hpp"
+ #endif
+ 
+ #include <cuda_runtime.h>
+@@ -145,6 +145,27 @@ void check_cards() {
+         for (const std::string& line : d.lines) std::fprintf(stderr, "fnx: %s\n", line.c_str());
+         if (!d.ok) throw std::runtime_error("the kernel self-test failed on " + std::string(prop.gcnArchName).substr(0, std::string(prop.gcnArchName).find(':')) + ", the split engine does not run on this card");
+     }
++#else
++    // the same rule on an NVIDIA card: anything but the architectures Strata has run the split on (arch_caps.hpp) gets the
++    // kernel check against a scalar reference before the model is loaded, so a machine nobody has tried answers in 20
++    // seconds instead of after a three-minute load.  FNX_SELFTEST=1 asks for it on a known card too, FNX_SELFTEST=0 skips it.
++    {
++        int cmaj = 0, cmin = 0;
++        ck(cudaDeviceGetAttribute(&cmaj, cudaDevAttrComputeCapabilityMajor, 0), "cudaDeviceGetAttribute");
++        ck(cudaDeviceGetAttribute(&cmin, cudaDevAttrComputeCapabilityMinor, 0), "cudaDeviceGetAttribute");
++        const int cc = cmaj * 10 + cmin;
++        const NvSelftestDecision d = nv_selftest_decide(cc, std::getenv("FNX_SELFTEST"), std::getenv("FNX_SELFTEST_FAIL"), [&](std::string& covered) {
++            for (int dev = 0; dev < NCARD; ++dev) {
++                std::string c;
++                const std::string bad = selftest_card(dev, c);
++                if (!bad.empty()) return "card " + std::to_string(dev) + ": " + bad;
++                covered += (covered.empty() ? "" : "; ") + c;
++            }
++            return std::string();
++        });
++        for (const std::string& line : d.lines) std::fprintf(stderr, "fnx: %s\n", line.c_str());
++        if (!d.ok) throw std::runtime_error("the kernel self-test failed on sm_" + std::to_string(cc) + ", the split engine does not run on this card");
++    }
+ #endif
+ }
+ 
+@@ -848,7 +869,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
+         w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
+         w.sh_gu = up.dense(up.rows2(L(l, "ffn_gate_shexp.weight"), range(c.ff0, c.ff1), L(l, "ffn_up_shexp.weight"), range(c.ff0, c.ff1)));
+         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
+-        if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
++        if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0 (gate type " + std::to_string(w.sh_gu.type) + ", down type " + std::to_string(w.sh_down.type) + ")");
+         if (l == PLE_LAYER) {
+             const Tensor& pk = L(l, "ple_key.weight");
+             const Tensor& pv = L(l, "ple_value.weight");
+@@ -1224,7 +1245,7 @@ Mtp::~Mtp() { free_mtp_cards(cards); }
+ // the cards (the app's rule, strata_control/split_engine.py, refuses it earlier; this is the same check for a start that skipped the rule). The
+ // server then starts the normal layer split. Q2_0 is not listed: the Gguf has already repacked it to Q4_0.
+ static void check_supported(const Gguf& g) {
+-    const uint32_t ok[] = {T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S};
++    const uint32_t ok[] = {T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S, T_IQ2_XS, T_IQ2_XXS};   // IQ2_XS/IQ2_XXS back in (delta4): qdot.cuh now carries their decode dots; the prompt path still needs FNX_PF_MOE_Q8=1 (no IQ2 prompt tiles)
+     for (const auto& kv : g.tensors()) {
+         const std::string& n = kv.first;
+         if (n.find("_exps.weight") == std::string::npos || n.find("shexp") != std::string::npos) continue;
+@@ -1443,8 +1464,12 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
+             }
+         });
+     for (auto& t : th) t.join();
+-    for (int c = 0; c < NCARD; ++c)
+-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
++    {   // every card's reason, not only the first: the cards fail in each other's wake and the first one is rarely the cause
++        std::string all;
++        for (int c = 0; c < NCARD; ++c)
++            if (!errs[c].empty()) { if (!all.empty()) all += " | "; all += "card " + std::to_string(c) + ": " + errs[c]; }
++        if (!all.empty()) throw std::runtime_error(all);
++    }
+     // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
+     const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
+     char rate[64] = "";
+@@ -1521,8 +1546,12 @@ void each_card(std::vector<CardW>& cards, F f) {
+             } catch (const std::exception& e) { errs[c] = e.what(); }
+         });
+     for (auto& t : th) t.join();
+-    for (int c = 0; c < NCARD; ++c)
+-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
++    {   // every card's reason, not only the first: the cards fail in each other's wake and the first one is rarely the cause
++        std::string all;
++        for (int c = 0; c < NCARD; ++c)
++            if (!errs[c].empty()) { if (!all.empty()) all += " | "; all += "card " + std::to_string(c) + ": " + errs[c]; }
++        if (!all.empty()) throw std::runtime_error(all);
++    }
+ }
+ }  // namespace
+ 
+@@ -1595,7 +1624,7 @@ void card_fields(CardW& c, F f) {
+         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
+ }
+ #if !FNX_27B   // the 27B has no holder (plain loads only)
+-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
++static_assert(sizeof(CardW) == 1024, "CardW changed: put what load_card stores in card_fields, then update this size");   // 896 + 128: ExpertCache's five EC_POOLS-sized arrays grew from 4 to 8 pools (896 is the value with EC_POOLS = 4; card_fields stores none of them)
+ #endif
+ // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
+ template <typename F>
+diff --git a/src/split/src/model.hpp b/src/split/src/model.hpp
+index b41038ccb..fe0f96916 100644
+--- a/src/split/src/model.hpp
++++ b/src/split/src/model.hpp
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "gguf.hpp"
++#include "arch_caps.hpp"   // what a compute capability can do, in one table (outside the namespace, both sides use it)
+ 
+ namespace fnx {
+ 
+@@ -93,7 +94,7 @@ struct DW {
+ // window's experts that are not in a slot take one of their pool's (CLOCK: the first slot not used since the pool's
+ // hand last passed), copied in from RAM, and the layer's tables (LayerW gu_e.ep / down_e.ep: rows of ep_gu / ep_dn)
+ // follow. All device memory; the same steps on every card.
+-constexpr int EC_POOLS = 4;
++constexpr int EC_POOLS = 8;   // a model with 7 routed expert types (IQ4_NL, IQ3_XXS, IQ3_S, IQ2_S, IQ2_XS, IQ2_XXS, Q2_0->Q4_0) needs one pool per size
+ struct ExpertCache {
+     int n_slots = 0;                     // all pools'
+     int n_pools = 0;
+diff --git a/src/split/src/qdot.cuh b/src/split/src/qdot.cuh
+index 211033cb5..5b1e9c329 100644
+--- a/src/split/src/qdot.cuh
++++ b/src/split/src/qdot.cuh
+@@ -104,10 +104,12 @@ template <> struct qtraits<T_IQ4_XS>  { static constexpr int qk = QK_K;   static
+ template <> struct qtraits<T_IQ3_S>   { static constexpr int qk = QK_K;   static constexpr int qi = QI3_S; };
+ template <> struct qtraits<T_IQ3_XXS> { static constexpr int qk = QK_K;   static constexpr int qi = QI3_XXS; };
+ template <> struct qtraits<T_IQ2_S>   { static constexpr int qk = QK_K;   static constexpr int qi = QI2_S; };
++template <> struct qtraits<T_IQ2_XS>  { static constexpr int qk = QK_K;   static constexpr int qi = QI2_XS; };
++template <> struct qtraits<T_IQ2_XXS> { static constexpr int qk = QK_K;   static constexpr int qi = QI2_XXS; };
+ 
+ // VDR = vec dot ratio: contiguous ints one thread handles per call in the decode (MMVQ) kernels
+ constexpr int VDR_Q4_0 = 2, VDR_Q5_1 = 2, VDR_Q8_0 = 2, VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q6_K = 1, VDR_IQ4_NL = 2, VDR_IQ4_XS = 4,
+-              VDR_IQ3_S = 2, VDR_IQ3_XXS = 2, VDR_IQ2_S = 2;
++              VDR_IQ3_S = 2, VDR_IQ3_XXS = 2, VDR_IQ2_S = 2, VDR_IQ2_XS = 2, VDR_IQ2_XXS = 2;
+ 
+ // ---------------------------------------------------------------- helpers (vecdotq.cuh)
+ static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32) {
+@@ -495,6 +497,78 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     return fnx::vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
+ 
++// IQ2_XXS / IQ2_XS (delta4, 17.11.2026): upstream text from vecdotq.cuh, only ggml_cuda_dp4a -> qd_dp4a. The productive 2gb pack carries
++// IQ2_XS/IQ2_XXS routed experts; without these two dots model.cpp's check_supported refuses the whole model.
++static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
++
++    const int q2 = get_int_b2(bq2->qs, iqs);
++    const uint8_t * aux8 = (const uint8_t *) &q2;
++    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
++
++    int sumi = 0;
++#pragma unroll
++    for (int k0 = 0; k0 < 8; k0 += 2) {
++        const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
++        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
++
++        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
++        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
++        sumi = qd_dp4a(grid0, u0, sumi);
++
++        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
++        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
++        sumi = qd_dp4a(grid1, u1, sumi);
++    }
++
++    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
++    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
++    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
++    return d * sumi;
++}
++
++static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
++
++    const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
++    const uint16_t * q2 = (const uint16_t *) &q2_packed;
++    const int ls0 = bq2->scales[iqs/2] & 0x0F;
++    const int ls1 = bq2->scales[iqs/2] >> 4;
++
++    int sumi0 = 0;
++    int sumi1 = 0;
++#pragma unroll
++    for (int l0 = 0; l0 < 8; l0 += 2) {
++        const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
++        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
++
++        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
++        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
++
++        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
++        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
++
++        if (l0 < 4) {
++            sumi0 = qd_dp4a(grid_l, u0, sumi0);
++            sumi0 = qd_dp4a(grid_h, u1, sumi0);
++        } else {
++            sumi1 = qd_dp4a(grid_l, u0, sumi1);
++            sumi1 = qd_dp4a(grid_h, u1, sumi1);
++        }
++    }
++    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
++    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
++    return d * sumi;
++}
++
+ // The three i-quant dots below are the CUDA ones (__vcmpne4 / __vsub4 sign expansion); a HIP build runs iqdot_hip.cuh's fnx_ variants
+ // instead and compiles these only as tools/iqdot_test.cu's reference.
+ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+diff --git a/src/split/src/selftest.hpp b/src/split/src/selftest.hpp
+index e0a73317c..7353076ec 100644
+--- a/src/split/src/selftest.hpp
++++ b/src/split/src/selftest.hpp
+@@ -1,7 +1,9 @@
+-// The kernel self-test of a card (HIP only; selftest.cu, rules and lines in hip/selftest_policy.hpp).
++// The kernel self-test of a card (selftest.cu; the HIP rules and lines in hip/selftest_policy.hpp, the NVIDIA ones in arch_caps.hpp).
+ #pragma once
+ #include <string>
+ 
++#include "arch_caps.hpp"
++
+ namespace fnx {
+ // runs the tests on device dev: "" when they all passed (covered: what ran, for the pass line), else the first failure in a few words
+ std::string selftest_card(int dev, std::string& covered);
+diff --git a/src/split/src/tensor_convert.hpp b/src/split/src/tensor_convert.hpp
+index 6693c7a67..847500a25 100644
+--- a/src/split/src/tensor_convert.hpp
++++ b/src/split/src/tensor_convert.hpp
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include "gguf.hpp"
++#include "iq3s_tables.hpp"   // ggml's iq3s_grid / kmask_iq2xs, for the IQ3_S reader below
+ 
+ namespace fnx {
+ namespace conv {
+@@ -144,6 +145,49 @@ inline void dequantize(uint32_t type, const uint8_t* src, size_t n, float* y) {
+             }
+         }
+         return;
++    case T_IQ3_S:
++        // ggml's dequantize_row_iq3_s (ggml-quants.c), block = 110 bytes: d (f16), qs[64], qh[8], signs[32], scales[4].
++        // Four bits of a 9-bit grid index live in qs, the ninth bit is folded out of qh; the sign of every value is one
++        // bit of signs. The grid is ggml's own iq3s_grid (iq3s_tables.hpp), four int8 values per u32.
++        for (size_t b = 0; b < n / 256; ++b) {
++            const uint8_t* p = src + b * 110;
++            uint16_t dh;
++            std::memcpy(&dh, p, 2);
++            const float d = h2f(dh);
++            const uint8_t* qs = p + 2;
++            const uint8_t* qh = p + 66;
++            const uint8_t* signs = p + 74;
++            const uint8_t* sc = p + 106;
++            float* o = y + b * 256;
++            for (int ib32 = 0; ib32 < 8; ib32 += 2) {
++                const float d1 = d * (1.0f + 2.0f * (float) (sc[ib32 / 2] & 0xF));
++                const float d2 = d * (1.0f + 2.0f * (float) (sc[ib32 / 2] >> 4));
++                for (int l = 0; l < 4; ++l) {
++                    const uint8_t* g1 = (const uint8_t*) (iq3s_grid + (qs[2 * l] | ((qh[0] << (8 - 2 * l)) & 256)));
++                    const uint8_t* g2 = (const uint8_t*) (iq3s_grid + (qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)));
++                    for (int j = 0; j < 4; ++j) {
++                        o[j] = d1 * (float) g1[j] * (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
++                        o[j + 4] = d1 * (float) g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
++                    }
++                    o += 8;
++                }
++                qs += 8;
++                signs += 4;
++                for (int l = 0; l < 4; ++l) {
++                    const uint8_t* g1 = (const uint8_t*) (iq3s_grid + (qs[2 * l] | ((qh[1] << (8 - 2 * l)) & 256)));
++                    const uint8_t* g2 = (const uint8_t*) (iq3s_grid + (qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)));
++                    for (int j = 0; j < 4; ++j) {
++                        o[j] = d2 * (float) g1[j] * (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
++                        o[j + 4] = d2 * (float) g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
++                    }
++                    o += 8;
++                }
++                qh += 2;
++                qs += 8;
++                signs += 4;
++            }
++        }
++        return;
+     case T_Q4_K:
+         for (size_t b = 0; b < n / 256; ++b) {
+             const uint8_t* p = src + b * 144;
+diff --git a/src/split/tools/arch_caps_test.cpp b/src/split/tools/arch_caps_test.cpp
+new file mode 100644
+index 000000000..fa7dccfe3
+--- /dev/null
++++ b/src/split/tools/arch_caps_test.cpp
+@@ -0,0 +1,81 @@
++// CPU unit test of src/arch_caps.hpp: the shared-memory table against the published CUDA figures, the layout the
++// kernels need against that table, and the self-test rule for a card Strata has not run the split on.  No GPU, no card.
++#include "../src/arch_caps.hpp"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++static int fails = 0;
++static void check(bool ok, const std::string& what) {
++    if (!ok) { ++fails; std::printf("FAIL: %s\n", what.c_str()); }
++}
++
++int main() {
++    using namespace fnx;
++
++    // the published per-block dynamic shared memory (CUDA Programming Guide, "Memory Information"): the table must say
++    // exactly this, because a kernel layout is chosen from it
++    const std::vector<std::pair<int, int>> published = {{61, 64}, {70, 96}, {75, 64}, {80, 163}, {86, 99}, {87, 163},
++                                                        {89, 99}, {90, 227}, {100, 227}, {103, 227}, {110, 227}, {120, 99}, {121, 99}};
++    for (const auto& e : published)
++        check(smem_per_block_kib(e.first) == e.second, "smem_per_block_kib(sm_" + std::to_string(e.first) + ") = " +
++                                                       std::to_string(smem_per_block_kib(e.first)) + ", published " + std::to_string(e.second));
++    // an unlisted capability takes the floor, never more: a bigger kernel than the card can launch is the failure to avoid
++    check(smem_per_block_kib(60) == SMEM_FLOOR_KIB && smem_per_block_kib(999) == SMEM_FLOOR_KIB, "an unlisted capability takes the floor");
++
++    // what k_gdn_ch_rec asks for (src/gdn_prompt.cuh: GCH 32, HS 128, the sub-chunk's prep floats): 32 columns are
++    // 72.6 KiB, 16 columns 56.6 KiB.  The 32-column layout therefore fits everywhere but a 64 KiB card, which is the
++    // whole reason the tree has a 16-column variant at all (the HIP build has always used it)
++    const int GCH = 32, HS = 128, PREP = 2 * GCH * GCH + 3 * GCH + 1;
++    const auto floats = [&](int gcb) { return 4 * (2 * GCH * (HS + 1) + HS * gcb + 4 * GCH * gcb + PREP); };
++    check(floats(32) == 74372, "the 32-column layout is 74372 bytes (72.6 KiB), got " + std::to_string(floats(32)));
++    check(floats(16) == 57988, "the 16-column layout is 57988 bytes (56.6 KiB), got " + std::to_string(floats(16)));
++    for (const auto& e : published) {
++        const bool wide = floats(32) <= smem_per_block(e.first);
++        const bool narrow_fits = floats(16) <= smem_per_block(e.first);
++        check(narrow_fits, "sm_" + std::to_string(e.first) + ": the 16-column layout must always fit");
++        // 32 columns need 72.6 KiB, so they fit exactly on a card with 96 KiB or more: the 64 KiB cards (6.1 Pascal,
++        // 7.5 Turing) are the ones the 16-column layout exists for
++        check(wide == (smem_per_block_kib(e.first) >= 96), "sm_" + std::to_string(e.first) + ": 32 columns " +
++                                                           (wide ? "fit" : "do not fit"));
++    }
++
++    // the two mma families the tree is laid out for (src/split/src/moe_mma.cuh: FNX_ARCH >= 80 uses m16n8k16, below it
++    // m8n8k4 with 64-row jobs) and the int8 paths compiled for the newer cards only
++    check(has_dp4a(61) && !has_dp4a(60), "dp4a from 6.1");
++    check(has_mma_16816(80) && !has_mma_16816(75), "the 16816 f16 mma from 8.0");
++    check(has_i8_attention(86) && !has_i8_attention(75), "the int8 attention path from 8.0");
++
++    // what Strata has run (strata_control/split_engine.py keeps the matching TESTED table for the card counts)
++    check(arch_run_by_strata(86) && arch_run_by_strata(120), "sm_86 and sm_120 are run architectures");
++    check(!arch_run_by_strata(75) && !arch_run_by_strata(90), "sm_75 and sm_90 are not: the self-test decides there");
++
++    // the rule: a known card starts without the self-test, an unknown card gets it, the environment can force or skip it
++    auto run_ok = [](std::string& covered) { covered = "expert tiles, attention tiles, dp4a, recurrent step"; return std::string(); };
++    auto run_bad = [](std::string&) { return std::string("attention tile mismatch"); };
++    NvSelftestDecision d = nv_selftest_decide(86, nullptr, nullptr, run_ok);
++    check(!d.run && d.ok && d.lines.empty(), "sm_86 starts without the self-test");
++    d = nv_selftest_decide(75, nullptr, nullptr, run_ok);
++    check(d.run && d.ok && d.lines.size() == 2, "sm_75 is announced as experimental and then tested");
++    check(d.lines[0].find("experimental") != std::string::npos && d.lines[0].find("sm_75") != std::string::npos, "the first line names the card");
++    check(d.lines[1].find("passed") != std::string::npos, "the second line reports the pass");
++    d = nv_selftest_decide(75, nullptr, nullptr, run_bad);
++    check(d.run && !d.ok && d.lines[1].find("does not run on this card") != std::string::npos, "a failed self-test stops the split engine");
++    d = nv_selftest_decide(86, (const char*) "1", nullptr, run_ok);
++    check(d.run && d.ok, "FNX_SELFTEST=1 asks a known card too");
++    d = nv_selftest_decide(75, (const char*) "0", nullptr, run_bad);
++    check(!d.run && d.ok && d.lines.empty(), "FNX_SELFTEST=0 skips it, the risk is the caller's");
++    d = nv_selftest_decide(86, (const char*) "1", (const char*) "1", run_ok);
++    check(d.run && !d.ok, "FNX_SELFTEST_FAIL=1 fails on purpose (the rule is testable without a broken card)");
++
++    // a person reading the line must learn what the card can do and what happens next
++    const std::string n86 = arch_note(86), n75 = arch_note(75);
++    check(n86.find("99 KiB") != std::string::npos && n86.find("run by Strata") != std::string::npos, "sm_86's line: " + n86);
++    check(n75.find("64 KiB") != std::string::npos && n75.find("not run by Strata") != std::string::npos, "sm_75's line: " + n75);
++
++    if (fails) { std::printf("arch_caps: %d FAIL\n", fails); return 1; }
++    std::printf("arch_caps: all checks passed (%d published capabilities, the 32-column layout is %d bytes, the 16-column %d)\n",
++                (int) published.size(), floats(32), floats(16));
++    return 0;
++}
+diff --git a/src/split/tools/qdot_test.cu b/src/split/tools/qdot_test.cu
+index e4cfcb2b2..1037cc52f 100644
+--- a/src/split/tools/qdot_test.cu
++++ b/src/split/tools/qdot_test.cu
+@@ -60,6 +60,8 @@ FNX_QD_PAIR(T_IQ4_XS, vec_dot_iq4_xs_q8_1, VDR_IQ4_XS_Q8_1_MMVQ)
+ FNX_QD_PAIR(T_IQ3_S, vec_dot_iq3_s_q8_1, VDR_IQ3_S_Q8_1_MMVQ)
+ FNX_QD_PAIR(T_IQ3_XXS, vec_dot_iq3_xxs_q8_1, VDR_IQ3_XXS_Q8_1_MMVQ)
+ FNX_QD_PAIR(T_IQ2_S, vec_dot_iq2_s_q8_1, VDR_IQ2_S_Q8_1_MMVQ)
++FNX_QD_PAIR(T_IQ2_XS, vec_dot_iq2_xs_q8_1, VDR_IQ2_XS_Q8_1_MMVQ)
++FNX_QD_PAIR(T_IQ2_XXS, vec_dot_iq2_xxs_q8_1, VDR_IQ2_XXS_Q8_1_MMVQ)
+ 
+ // one thread per (weight block, lane): the call the decode kernels make (kernels.cu k_mmvq: y + kbx * (qk / QK8_1), iqs = vdr * lane)
+ template <GgmlType T>
+@@ -219,6 +221,8 @@ int main(int argc, char** argv) {
+     ok &= run<T_IQ3_S>("IQ3_S", sizeof(block_iq3_s), {0}, n, 9, VDR_IQ3_S);
+     ok &= run<T_IQ3_XXS>("IQ3_XXS", sizeof(block_iq3_xxs), {0}, n, 10, VDR_IQ3_XXS);
+     ok &= run<T_IQ2_S>("IQ2_S", sizeof(block_iq2_s), {0}, n, 11, VDR_IQ2_S);
++    ok &= run<T_IQ2_XS>("IQ2_XS", sizeof(block_iq2_xs), {0}, n, 12, VDR_IQ2_XS);
++    ok &= run<T_IQ2_XXS>("IQ2_XXS", sizeof(block_iq2_xxs), {0}, n, 13, VDR_IQ2_XXS);
+     std::printf(ok ? "qdot_test: PASS\n" : "qdot_test: FAIL\n");
+     return ok ? 0 : 1;
+ }
+diff --git a/src/split/tools/selftest_main.cpp b/src/split/tools/selftest_main.cpp
+index 0288e5203..9e8c20966 100644
+--- a/src/split/tools/selftest_main.cpp
++++ b/src/split/tools/selftest_main.cpp
+@@ -1,7 +1,11 @@
+-// Standalone run of the engine's kernel self-test (src/selftest.cu) on one card: no model, no engine. Built by the optional CMake target strata-split-selftest
+-// (src/split/CMakeLists.txt; HIP only, off by default). Prints the card and the result; exit 0 when every test passed.
++// Standalone run of the engine's kernel self-test (src/selftest.cu) on one card: no model, no engine start. Built by the optional CMake target strata-split-selftest
++// (src/split/CMakeLists.txt; off by default, built by name). Prints the card and the result; exit 0 when every test passed.
+ //   selftest_main [device]
++#if FNX_HIP
+ #include <hip/hip_runtime.h>
++#else
++#include <cuda_runtime.h>
++#endif
+ 
+ #include <chrono>
+ #include <cstdio>
+@@ -12,12 +16,27 @@
+ 
+ int main(int argc, char** argv) {
+     const int dev = argc > 1 ? std::atoi(argv[1]) : 0;
++#if FNX_HIP
+     hipDeviceProp_t p;
+     if (hipGetDeviceProperties(&p, dev) != hipSuccess) {
+         std::printf("no device %d\n", dev);
+         return 2;
+     }
+     std::printf("device %d: %s (%s), %d CUs, %.1f GiB\n", dev, p.name, p.gcnArchName, p.multiProcessorCount, (double) p.totalGlobalMem / (1 << 30));
++#else
++    cudaDeviceProp p;
++    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
++        std::printf("no device %d\n", dev);
++        return 2;
++    }
++    std::printf("device %d: %s (sm_%d%d), %d SMs, %.1f GiB, %d KiB shared memory a block\n", dev, p.name, p.major, p.minor,
++                p.multiProcessorCount, (double) p.totalGlobalMem / (1 << 30), (int) (p.sharedMemPerBlockOptin / 1024));
++    // the card's own figure against the table the kernels were laid out for: a difference means the table needs the card
++    const int want = fnx::smem_per_block(p.major * 10 + p.minor);
++    if ((int) p.sharedMemPerBlockOptin < want)
++        std::printf("NOTE: smem_per_block(sm_%d%d) says %d KiB, the card gives %d KiB -- arch_caps.hpp is wrong for this card\n",
++                    p.major, p.minor, want / 1024, (int) (p.sharedMemPerBlockOptin / 1024));
++#endif
+     std::string covered;
+     const auto t0 = std::chrono::steady_clock::now();
+     const std::string bad = fnx::selftest_card(dev, covered);
+diff --git a/strata_control/split_engine.py b/strata_control/split_engine.py
+index b395b7faa..f0b8b032c 100644
+--- a/strata_control/split_engine.py
++++ b/strata_control/split_engine.py
+@@ -12,7 +12,7 @@ has actually been run:
+ 
+   - not turned off (mode(): "auto" by default; "on" is the same rule but a refusal is reported; "off" never);
+   - Linux, 2 to 4 cards of ONE make (NVIDIA, or AMD RDNA4 gfx1201: the R9700 and RX 9070), all the same model of card and memory size;
+-  - a card architecture and card count that have been run (TESTED, per make): NVIDIA sm_86 on 2 cards, AMD gfx1201 on 4 cards. Others build
++  - a card architecture and card count that have been run (TESTED, per make: NVIDIA sm_86 on 2 and 4 cards, AMD gfx1201 on 4 cards. Others build
+     but stay off unless the caller says allow_untested (testers); the Decision says which part is untested in plain words;
+   - AMD gfx1201 is automatic like NVIDIA (the owner's decision: default on for two or more cards, off with `--split-engine off`); AUTO_SPLIT_AMD_ARCHS is the
+     one constant that says which AMD architectures start it by themselves, every other AMD architecture keeps the layer split silently;
+@@ -31,13 +31,14 @@ engine refuses or fails to start (serve/server.py, "split_fallback").
+ from __future__ import annotations
+ 
+ import dataclasses
++import os
+ import pathlib
+ import re
+ 
+ # What has been run with the host exchange, per make: {make: {architecture: card counts}}.  NVIDIA: 2x RTX A6000 (boston, sm_86), 2x RTX PRO 6000 (srv118, sm_120).
+ # AMD: 4x Radeon AI PRO R9700 (r9700, gfx1201; phaseA-tests/sfnx/RESULTS-HIP.md): 4 cards with UD-Q4_K_XL, 3 cards with the IQ3_S set, 2 cards with the IQ3_S set at 8K context and 2 slots only
+ # (the memory rule below refuses that by its estimate; the counts here say the engine has run on them).
+-TESTED = {"nvidia": {"sm_86": (2,), "sm_120": (2,)}, "amd": {"gfx1201": (2, 3, 4)}}
++TESTED = {"nvidia": {"sm_86": (2, 4), "sm_120": (2,)}, "amd": {"gfx1201": (2, 3, 4)}}   # sm_86 on 4 cards: run and measured 2026-11-11 (4x RTX A4000, 106-116 tok/s)
+ # the engine package's kernels (one binary per card count with a code object for each AMD architecture): any other card is refused. AMD beyond gfx1201 is EXPERIMENTAL: only an explicit
+ # `--split-engine on` starts it there (never auto), and the engine runs its kernel self-test on the card before it loads the model (src/split/src/hip/selftest_policy.hpp)
+ BUILT_ARCHS = {"nvidia": ("sm_86", "sm_120"), "amd": ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1200", "gfx1201")}
+@@ -62,15 +63,53 @@ MAX_CARDS = 4
+ LAYERS, EXPERTS = 48, 512          # Qwen3.8-Flash-Next
+ EXPERT_TYPES = {"Q4_K", "Q5_K", "Q5_1", "Q8_0", "Q4_0",           # the routed-expert kernels (decode and prompt)
+                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL",  # ggml's i-quant vec_dots; prompt tiles in src/moe_mma_iq.cuh
+-                "Q2_0"}                                           # Strata's 2-bit type: the loader repacks it to Q4_0 blocks (twice the bytes)
++                "Q2_0",                                            # Strata's 2-bit type: the loader repacks it to Q4_0 (twice the bytes)
++                "IQ2_XS", "IQ2_XXS"}                              # CUDA only: ggml's vec_dot_iq2_xs/xxs_q8_1 (vecdotq.cuh), no MMA tile
+ # the loader (Gguf::convert_small_tensors) converts the dense tensors to Q8_0/F32 only when the file has one of these routed types
+ CONVERT_TRIGGERS = {"IQ2_S", "IQ3_XXS", "IQ3_S", "Q2_0"}
+ # and can read these types to do it
+-CONVERTED_FROM = {"Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS", "IQ4_NL", "BF16", "F16", "F32"}
++CONVERTED_FROM = {"Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS", "IQ4_NL", "BF16", "F16", "F32",
++                  "IQ3_S"}   # IQ3_S: tensor_convert.hpp carries ggml's dequantize_row_iq3_s (the IQ3_S sets' embeddings/shared experts)
+ PLE_TYPES = {"IQ4_NL", "Q8_0"}     # per_layer_token_embd.weight as the host's row reader takes it
+ # measured on 2x RTX A6000 48 GB at 128K context, 6 lanes (phaseA-tests/sfnx/RESULTS.md section 8): a card held half the experts plus
+ # 8.4 GiB of dense weights, buffers and the K/V pool, with 3.6 GiB left free. 9 GiB per card is that plus a little.
+ CARD_OVERHEAD_GIB = 9.0
++#: What a card must hold besides its share of the experts, for THIS card count: dense weights, buffers and the K/V pool.
++#: 9 GiB is the 2-card figure above. On 4 x RTX A4000 16 GB the running layer split was measured at 15,4 GiB a card with
++#: 11,64 GiB of it the experts (46,56 GiB routed / 4), i.e. about 3,8 GiB of dense weights, buffers and K/V pool at 256K context.
++#: STRATA_SPLIT_CARD_OVERHEAD_GIB=<zahl> replaces the calibrated value with a measured one, so the fit is decided on the
++#: machine's own numbers instead of on another PC's.
++CARD_VRAM_TOLERANCE_MIB = 1536   # same card model, sizes apart by up to 1,5 GiB (ECC reserved on one card)
++
++
++# The engine does not put every routed expert into a card. Its loader keeps the coldest share of them in page-locked
++# host RAM by default (src/split/src/model.cpp choose_residency: FNX_EXPERT_RAM_GIB, 3.0 GiB when unset, "off" with
++# FNX_ARENA=0 for none). The fit has to count the same arithmetic the loader performs, or a model that loads cleanly
++# is vetoed as too big.
++EXPERT_RAM_GIB = 3.0
++
++
++def expert_ram_gib() -> float:
++    """How many GiB of routed experts the loader keeps in host RAM instead of in a card."""
++    if os.environ.get("FNX_ARENA", "1").strip() == "0":
++        return 0.0
++    raw = os.environ.get("FNX_EXPERT_RAM_GIB", "").strip()
++    if raw.lower() == "off":
++        return 0.0
++    try:
++        return max(0.0, float(raw)) if raw else EXPERT_RAM_GIB
++    except ValueError:
++        return EXPERT_RAM_GIB
++
++
++def card_overhead_gib(n: int) -> float:
++    raw = os.environ.get("STRATA_SPLIT_CARD_OVERHEAD_GIB", "").strip()
++    if raw:
++        try:
++            return float(raw)
++        except ValueError:
++            pass
++    return CARD_OVERHEAD_GIB
+ # What a card must have FREE, not just own: other programs on a shared box or a desktop hold part of it (srv118, 2 x RTX PRO 6000 held to 8 GB free: the plan still
+ # said "all-cards split" and would have fetched the 5.2 GB draft layer). The fit counts free memory minus the engine's own default reserve (--vram-reserve-mib 700,
+ # strata_control.drafting.SLOT_RESERVE_MIB); a card whose free memory is not known is counted by its size, as before.
+@@ -128,6 +167,7 @@ class Decision:
+     untested: list[str] = dataclasses.field(default_factory=list)   # what about this setup nobody has run
+     need_vram_gib: float = 0.0
+     need_ram_gib: float = 0.0
++    host_experts_gib: float = 0.0   # routed experts the plan parks in host RAM (split_config writes it into the engine's env)
+     quiet: bool = False             # auto mode and a "no": the launch says nothing and starts the normal layer split
+     arch: str = ""                  # the cards' architecture ("sm_86", "gfx1201"); empty when no card was probed (the run manifest records it)
+     routed_types: tuple = ()        # the model's routed-expert types, sorted (the run manifest records them)
+@@ -188,6 +228,35 @@ def scan_model(first_shard: str | pathlib.Path) -> ModelFacts:
+     return ModelFacts(routed_types, routed_bytes, embd_type, shexp, embd_ram, layers, experts, ple_type, output_type)
+ 
+ 
++# The published CUDA opt-in shared memory per block (KiB). src/split/src/arch_caps.hpp is the authority for the
++# engine; tests/split/test_arch_caps_parity.py compares the two tables so they cannot drift apart.
++SHARED_MEM_KIB = {70: 96, 75: 64, 80: 163, 86: 99, 87: 163, 89: 99, 120: 99, 121: 99}
++SMEM_FLOOR_KIB = 64                       # what an unlisted capability is assumed to have
++PROMPT_LAYOUT_KIB = 73                    # the 32-column recurrent prompt kernel asks 74372 bytes a block
++
++
++def shared_mem_kib(arch: str) -> int:
++    cc = int(arch[3:]) if arch.startswith("sm_") else 0
++    if cc in SHARED_MEM_KIB:
++        return SHARED_MEM_KIB[cc]
++    if 90 <= cc < 120:
++        return 227
++    if 120 <= cc < 130:
++        return 99
++    return SMEM_FLOOR_KIB
++
++
++def arch_note(arch: str) -> str:
++    """One plain line about what a card the engine has never run on can do, so an untested architecture is a
++    measured question and not a guess."""
++    if not arch.startswith("sm_"):
++        return ""
++    k = shared_mem_kib(arch)
++    layout = ("32-column prompt layout fits" if k >= PROMPT_LAYOUT_KIB
++              else "prompt kernel drops to 16 columns, 32 need 73 KiB")
++    return f"{arch}: {k} KiB shared memory a block, {layout}, self-test proves the kernels first"
++
++
+ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: float, ram_available_gib: float, model: ModelFacts,
+            context: int = TESTED_CONTEXT, allow_untested: bool = False, cache_mib: int = CONVERSATION_CACHE_MIB) -> Decision:
+     """Whether the all-cards split engine runs this launch, with plain reasons when not."""
+@@ -207,7 +276,12 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
+         if len({c.vendor for c in cards}) != 1:
+             why.append("the cards are of different makes")
+         if len({(c.name, c.vram_mib) for c in cards}) != 1:
+-            why.append("the cards are not all the same model and size")
++            # Same model and same compute capability, sizes apart by at most a reserved block (one card with ECC on holds
++            # 1 GiB less): the engine splits by the smallest card, so this is a note, not a stop.
++            same_model = len({c.name for c in cards}) == 1 and len({c.cc for c in cards}) == 1
++            spread = max(c.vram_mib for c in cards) - min(c.vram_mib for c in cards)
++            if not (same_model and spread <= CARD_VRAM_TOLERANCE_MIB):
++                why.append("the cards are not all the same model and size")
+         if make == "nvidia" and not all(c.cc >= 70 for c in cards):
+             why.append("a card is too old for it")
+         if make == "amd" and not all(c.arch_name in BUILT_ARCHS["amd"] for c in cards):
+@@ -223,7 +297,7 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
+             why.append(f"it has only been run on {ran} cards, not {n}")
+     if cards and not all(c.arch_name in tested for c in cards):
+         if allow_untested:
+-            untested.append(f"card architecture {cards[0].arch_name}")
++            untested.append(arch_note(cards[0].arch_name) or f"card architecture {cards[0].arch_name}")
+         else:
+             ran = "/".join(tested) if tested else "no"
+             why.append(f"it has only been run on {ran} cards, not {cards[0].arch_name}")
+@@ -242,16 +316,19 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
+     if model.embd_type not in readable:
+         why.append(f"the token embeddings are {model.embd_type}, it needs Q8_0" if not converts else
+                    f"the token embeddings are {model.embd_type}, which it cannot convert to Q8_0")
+-    if model.shexp_types and not set(model.shexp_types) - {"F32"} <= readable:   # the router gate vector beside the shared expert is F32
+-        why.append("the shared expert is " + "/".join(sorted(set(model.shexp_types) - readable - {"F32"})) + ", which it cannot read" + ("" if converts else " (it needs Q8_0)"))
++    # Q2_0 counts as readable for the shared experts too: the loader repacks every Q2_0 tensor — routed and shared
++    # experts alike — into Q4_0 blocks at load, losslessly (tensor_convert.hpp repack_q2_0_to_q4_0, gguf.cpp).
++    if model.shexp_types and not set(model.shexp_types) - {"F32", "Q2_0"} <= readable:
++        why.append("the shared expert is " + "/".join(sorted(set(model.shexp_types) - readable - {"F32", "Q2_0"})) + ", which it cannot read" + ("" if converts else " (it needs Q8_0)"))
+     if model.output_type is not None and model.output_type not in readable:
+         why.append(f"the output head is {model.output_type}, which it cannot read" + ("" if converts else " (it needs Q8_0)"))
+     if model.ple_type is not None and model.ple_type not in PLE_TYPES:
+         why.append(f"the per-layer embedding table is {model.ple_type}, it needs IQ4_NL or Q8_0")
+     if (model.layers, model.experts) != (LAYERS, EXPERTS):
+         why.append("it only knows Qwen3.8-Flash-Next (48 layers, 512 experts)")
+-    need_vram = model.routed_bytes / GIB / max(n, 1) + CARD_OVERHEAD_GIB
+-    need_ram = model.embd_ram_bytes / GIB + RAM_PINNED_BUFFERS_GIB + cache_mib / 1024
++    host_experts = min(expert_ram_gib(), model.routed_bytes / GIB)     # parked in host RAM by the loader, not in a card
++    need_vram = (model.routed_bytes / GIB - host_experts) / max(n, 1) + card_overhead_gib(n)
++    need_ram = model.embd_ram_bytes / GIB + host_experts + RAM_PINNED_BUFFERS_GIB + cache_mib / 1024
+     if cards and n >= 2 and min(c.room_mib for c in cards) / 1024 < need_vram:
+         has = f"{min(c.room_mib for c in cards) / 1024:.0f} GiB" + (" free" if any(c.free_mib is not None for c in cards) else "")   # free memory when it was read, else the size
+         why.append(f"all the experts do not fit in the cards' memory (each card needs about {need_vram:.0f} GiB, has {has})")
+@@ -259,8 +336,8 @@ def decide(*, enabled: bool, system: str, cards: list[Card], ram_total_gib: floa
+         why.append(f"there is not enough free RAM (about {need_ram + RAM_SPARE_GIB:.0f} GiB needed, {ram_available_gib:.0f} GiB free)")
+     facts = dict(arch="/".join(archs), routed_types=tuple(sorted(model.routed_types)))
+     if why:
+-        return Decision(False, why, n, untested, need_vram, need_ram, **facts)
+-    return Decision(True, [], n, untested, need_vram, need_ram, **facts)
++        return Decision(False, why, n, untested, need_vram, need_ram, host_experts, **facts)
++    return Decision(True, [], n, untested, need_vram, need_ram, host_experts, **facts)
+ 
+ 
+ def split_config(base: dict, decision: Decision, *, exe: str, native: str, mtp_dir: str | None, draft_vocab: str, context: int,
+@@ -278,8 +355,15 @@ def split_config(base: dict, decision: Decision, *, exe: str, native: str, mtp_d
+                    "--spec", "6", "--lookup", "15", "--conversation-cache-mib", str(cache_mib), "--batch", str(min(MAX_LANES, max(lanes, 1)))]
+     if vision:
+         cfg["args"].append("--vision")
+-    # every expert in the cards' memory, no expert cache, no arena: the engine reads these two at start
+-    cfg["env"] = {**(base.get("env") or {}), "FNX_ARENA": "0", "FNX_EXPERT_RAM_GIB": "off"}
++    # the engine reads these two at start: the arena, and how much of the routed experts sits in host RAM. They have to
++    # say what the memory rule counted (Decision.host_experts_gib): with FNX_ARENA=0 the engine has no rescue at all —
++    # the "VRAM short ... more of the coldest experts to RAM" rounds sit inside `if (m.arena)` in src/split/src/engine.cu —
++    # so a plan that counts parked experts and then writes "off" OOMs in the prefill (2gb, 4 x 16 GiB: 46,6 GiB of experts,
++    # 15,3 GiB free a card: cudaMalloc of 508 MiB on card 0 failed with 332 MiB free). Only a rig whose experts really
++    # all fit in a card gets "no arena, no expert in host RAM".
++    host = decision.host_experts_gib
++    cfg["env"] = ({**(base.get("env") or {}), "FNX_ARENA": "0", "FNX_EXPERT_RAM_GIB": "off"} if host <= 0 else
++                  {**(base.get("env") or {}), "FNX_ARENA": "1", "FNX_EXPERT_RAM_GIB": f"{host:.1f}"})
+     cfg["split_fallback"] = {k: base[k] for k in ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting", "cwd") if k in base}
+     # The split engine runs the model's own draft layer (the MTP) and nothing else. Saying so in the config ("drafting": "mtp") keeps serve/server.py's
+     # drafter step, which resolves Auto to DFlash2 where the engine has it, from adding DFlash2 flags to the split engine's arguments (it would refuse them
+diff --git a/tests/split/test_arch_caps_parity.py b/tests/split/test_arch_caps_parity.py
+new file mode 100644
+index 000000000..659d3665f
+--- /dev/null
++++ b/tests/split/test_arch_caps_parity.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++# /// script
++# requires-python = ">=3.12"
++# ///
++"""Hält die zwei Shared-Memory-Tabellen zusammen: die des Engine-Codes (src/split/src/arch_caps.hpp) und die der
++Kartenregel (strata_control/split_engine.py). Bewiesen wird über den Compiler, nicht über eingelesenen Text --
++ein kleines C++-Programm gegen den Header ausgedruckt und Zahl für Zahl gegen shared_mem_kib() gehalten.
++
++    python3 tests/split/test_arch_caps_parity.py
++"""
++import pathlib
++import subprocess
++import sys
++import tempfile
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++from strata_control import split_engine as SE                     # noqa: E402
++
++CCS = [61, 70, 75, 80, 86, 87, 89, 90, 100, 103, 110, 120, 121, 130, 135]
++
++CPP = """
++#include "arch_caps.hpp"
++#include <cstdio>
++int main() {
++    const int ccs[] = {%s};
++    for (int cc : ccs) printf("%%d:%%d\\n", cc, fnx::smem_per_block_kib(cc));
++    return 0;
++}
++""" % ", ".join(str(c) for c in CCS)
++
++
++def main() -> int:
++    with tempfile.TemporaryDirectory() as td:
++        src = pathlib.Path(td) / "probe.cpp"
++        exe = pathlib.Path(td) / "probe"
++        src.write_text(CPP, encoding="utf-8")
++        build = subprocess.run(["g++", "-std=c++17", f"-I{ROOT / 'src/split/src'}", str(src), "-o", str(exe)],
++                               capture_output=True, text=True)
++        if build.returncode != 0:
++            print("arch_caps.hpp ließ sich nicht bauen:\n" + build.stderr)
++            return 1
++        out = subprocess.run([str(exe)], capture_output=True, text=True)
++        if out.returncode != 0:
++            print("Der C++-Ausdruck lief nicht:\n" + out.stderr)
++            return 1
++        cpp = {int(a): int(b) for a, b in (line.split(":") for line in out.stdout.split())}
++
++    bad = 0
++    for cc in CCS:
++        py = SE.shared_mem_kib(f"sm_{cc}")
++        mark = "ok" if py == cpp[cc] else "ANDERS"
++        if py != cpp[cc]:
++            bad += 1
++        print(f"  sm_{cc:<4} C++ {cpp[cc]:>4} KiB   Python {py:>4} KiB   {mark}")
++    # die Layout-Entscheidung selbst: ab welcher Karte passen 32 Spalten?
++    wide_cpp = [cc for cc in CCS if cpp[cc] * 1024 >= 74372]
++    wide_py = [cc for cc in CCS if SE.shared_mem_kib(f"sm_{cc}") * 1024 >= SE.PROMPT_LAYOUT_KIB * 1024]
++    if wide_cpp != wide_py:
++        bad += 1
++        print(f"  Layout-Schwelle ANDERS: C++ {wide_cpp}, Python {wide_py}")
++    if bad:
++        print(f"arch_caps-Parität: {bad} Abweichungen")
++        return 1
++    print(f"arch_caps-Parität: alle {len(CCS)} Stufen gleich (32 Spalten ab {wide_cpp[0]}, darunter 16)")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/split/test_split_engine.py b/tests/split/test_split_engine.py
+index 226631a22..ba5c1268a 100644
+--- a/tests/split/test_split_engine.py
++++ b/tests/split/test_split_engine.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import re
+ import unittest
+ from pathlib import Path
+@@ -158,8 +159,9 @@ class Config(unittest.TestCase):
+         self.assertEqual(cfg["gpu"], [0, 1])
+         self.assertIn("--vision", cfg["args"])
+         self.assertEqual(cfg["args"][cfg["args"].index("--batch") + 1], "6")
+-        self.assertEqual(cfg["env"]["FNX_ARENA"], "0")
+-        self.assertEqual(cfg["env"]["FNX_EXPERT_RAM_GIB"], "off")
++        # the fit counts 3 GiB of the experts in host RAM (expert_ram_gib's default) — the engine has to be told the same
++        self.assertEqual(cfg["env"]["FNX_ARENA"], "1")
++        self.assertEqual(cfg["env"]["FNX_EXPERT_RAM_GIB"], "3.0")
+         self.assertEqual(cfg["env"]["STRATA_X"], "1")
+         self.assertNotIn("layer_split", cfg)
+         fb = cfg["split_fallback"]
+@@ -168,6 +170,21 @@ class Config(unittest.TestCase):
+         self.assertEqual(fb["layer_split"], "auto")
+         self.assertEqual(self.base()["args"], ["--pack", "p", "--native", "m.gguf", "--layer-split", "auto"])   # the base is not changed
+ 
++    def test_the_written_env_says_what_the_memory_rule_counted(self):
++        # The engine's rescue rounds ("VRAM short ... more of the coldest experts to RAM") only run with the arena on:
++        # they sit inside `if (m.arena)` in src/split/src/engine.cu. A config that counts parked experts in the fit and
++        # then writes "off" + arena off OOMs in the prefill (2gb, 4 x 16 GiB: cudaMalloc of 508 MiB on card 0, 332 MiB free).
++        run = lambda: S.split_config(self.base(), decide(), exe="/e/s", native="/m/1.gguf", mtp_dir="/d",
++                                     draft_vocab="/v", context=131072, lanes=6, vision=False)
++        self.assertEqual(run()["env"]["FNX_EXPERT_RAM_GIB"], "3.0")
++        self.assertEqual(run()["env"]["FNX_ARENA"], "1")
++        os.environ["FNX_EXPERT_RAM_GIB"] = "off"          # a rig whose experts all fit in a card: nothing parked, no arena
++        try:
++            self.assertEqual(run()["env"]["FNX_EXPERT_RAM_GIB"], "off")
++            self.assertEqual(run()["env"]["FNX_ARENA"], "0")
++        finally:
++            os.environ.pop("FNX_EXPERT_RAM_GIB", None)
++
+     def test_no_config_for_a_refusal(self):
+         with self.assertRaises(ValueError):
+             S.split_config(self.base(), decide(enabled=False), exe="e", native="n", mtp_dir="m", draft_vocab="v", context=1)
