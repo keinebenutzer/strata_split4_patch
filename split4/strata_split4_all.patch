@@ -1,7 +1,7 @@
-diff --git a/src/split/CMakeLists.txt b/src/split/CMakeLists.txt
-index 21998ed79..7e807062e 100644
---- a/src/split/CMakeLists.txt
-+++ b/src/split/CMakeLists.txt
+diff --git a/engine/src/split/CMakeLists.txt b/engine/src/split/CMakeLists.txt
+index 31102acda..a8ec34ab8 100644
+--- a/engine/src/split/CMakeLists.txt
++++ b/engine/src/split/CMakeLists.txt
 @@ -68,9 +68,7 @@ set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
  set(_sp_engine
      ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu
@@ -26,7 +26,7 @@ index 21998ed79..7e807062e 100644
  #   cmake --build <dir> --target strata-split-selftest && <dir>/src/split/strata-split-selftest [device]     (exit 0: every test passed)
  if(_fnx_hip)
    list(GET STRATA_SPLIT_CARDS 0 _nst)
-@@ -158,12 +156,28 @@ if(_fnx_hip)
+@@ -158,12 +156,27 @@ if(_fnx_hip)
    target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
    target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
    set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
@@ -36,8 +36,7 @@ index 21998ed79..7e807062e 100644
 +  list(GET STRATA_SPLIT_CARDS 0 _nst)
 +  set(_t strata-split-selftest)
 +  add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu ${_sp_kparts})
-+  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda
-+                             ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/include)
++  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
 +  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1
 +                             FNX_PF_JOB=${STRATA_SPLIT_PF_JOB} FNX_DIR="${_sp}")
 +  target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
@@ -51,16 +50,16 @@ index 21998ed79..7e807062e 100644
  # the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
  if(STRATA_BUILD_TESTS)
    list(GET STRATA_SPLIT_CARDS 0 _n0)
--  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test)
-+  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test arch_caps_test)
+-  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test pf_pick_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test)
++  foreach(_tt expert_residency_test batch_plan_test pf_ring_plan_test pf_pick_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test memlock_test arch_caps_test)
      add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
      target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
      target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)
-diff --git a/src/split/src/arch_caps.hpp b/src/split/src/arch_caps.hpp
+diff --git a/engine/src/split/src/arch_caps.hpp b/engine/src/split/src/arch_caps.hpp
 new file mode 100644
 index 000000000..cde7e072b
 --- /dev/null
-+++ b/src/split/src/arch_caps.hpp
++++ b/engine/src/split/src/arch_caps.hpp
 @@ -0,0 +1,94 @@
 +#pragma once
 +// What a CUDA compute capability brings, in one table instead of `#if FNX_ARCH >= 80` spread over the kernels: the
@@ -156,10 +155,10 @@ index 000000000..cde7e072b
 +}
 +
 +}  // namespace fnx
-diff --git a/src/split/src/gdn_prompt.cuh b/src/split/src/gdn_prompt.cuh
+diff --git a/engine/src/split/src/gdn_prompt.cuh b/engine/src/split/src/gdn_prompt.cuh
 index 745c7e87a..a24cb8bbc 100644
---- a/src/split/src/gdn_prompt.cuh
-+++ b/src/split/src/gdn_prompt.cuh
+--- a/engine/src/split/src/gdn_prompt.cuh
++++ b/engine/src/split/src/gdn_prompt.cuh
 @@ -163,13 +163,20 @@ __global__ void __launch_bounds__(GDN_PF_THREADS) k_gdn_pf_rec(const float* __re
  // k_gdn_ch_prep makes what does not depend on the state for every sub-chunk and head at once (T, P, G, the decays to the
  // end, b); k_gdn_ch_rec walks the sub-chunks in order per (value head, GCB columns), the state's columns in shared
@@ -198,10 +197,10 @@ index 745c7e87a..a24cb8bbc 100644
  // a thread's share of a sub-chunk's inputs, fetched into registers while the sub-chunk before computes
  constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_THREADS,
                GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
-diff --git a/src/split/src/gguf.cpp b/src/split/src/gguf.cpp
+diff --git a/engine/src/split/src/gguf.cpp b/engine/src/split/src/gguf.cpp
 index bf3da9d6a..69ac0b02b 100644
---- a/src/split/src/gguf.cpp
-+++ b/src/split/src/gguf.cpp
+--- a/engine/src/split/src/gguf.cpp
++++ b/engine/src/split/src/gguf.cpp
 @@ -35,6 +35,8 @@ TypeInfo type_info(uint32_t t) {
          case T_Q5_K: return {256, 176};
          case T_Q6_K: return {256, 210};
@@ -228,10 +227,10 @@ index bf3da9d6a..69ac0b02b 100644
          if (want == 0xFFFFFFFFu || want == t.type) continue;
          owned_.emplace_back();
          conv::convert(t, want, owned_.back());
-diff --git a/src/split/src/gguf.hpp b/src/split/src/gguf.hpp
+diff --git a/engine/src/split/src/gguf.hpp b/engine/src/split/src/gguf.hpp
 index 2bd5efec6..a0b200df2 100644
---- a/src/split/src/gguf.hpp
-+++ b/src/split/src/gguf.hpp
+--- a/engine/src/split/src/gguf.hpp
++++ b/engine/src/split/src/gguf.hpp
 @@ -22,7 +22,7 @@ namespace fnx {
  
  enum GgmlType : uint32_t {
@@ -241,11 +240,11 @@ index 2bd5efec6..a0b200df2 100644
      T_IQ4_XS = 23, T_BF16 = 30, T_Q2_0 = 42,   // 42: Strata's 64-value 2-bit blocks (not in llama.cpp)
  };
  
-diff --git a/src/split/src/iq3s_tables.hpp b/src/split/src/iq3s_tables.hpp
+diff --git a/engine/src/split/src/iq3s_tables.hpp b/engine/src/split/src/iq3s_tables.hpp
 new file mode 100644
 index 000000000..c21fbce90
 --- /dev/null
-+++ b/src/split/src/iq3s_tables.hpp
++++ b/engine/src/split/src/iq3s_tables.hpp
 @@ -0,0 +1,84 @@
 +// strata-split: die ggml-Tabellen, die tensor_convert.hpp fuer die IQ3_S-Umwandlung braucht.
 +// Erzeugt aus third_party/strata-ggml/ggml/src/ggml-common.h (GGML_TABLE-Blöcke, Werte unveraendert).
@@ -331,10 +330,10 @@ index 000000000..c21fbce90
 +};
 +}  // namespace conv
 +}  // namespace fnx
-diff --git a/src/split/src/kernels.cu b/src/split/src/kernels.cu
+diff --git a/engine/src/split/src/kernels.cu b/engine/src/split/src/kernels.cu
 index 36f8d3dc0..05db962b2 100644
---- a/src/split/src/kernels.cu
-+++ b/src/split/src/kernels.cu
+--- a/engine/src/split/src/kernels.cu
++++ b/engine/src/split/src/kernels.cu
 @@ -137,6 +137,13 @@ template <GgmlType type> __device__ __forceinline__ float vdot(const void* v, co
      else if constexpr (type == T_IQ2_S) return fnx_vec_dot_iq2_s_q8_1(v, y, kbx, iqs);
  #else
@@ -385,10 +384,10 @@ index 36f8d3dc0..05db962b2 100644
          default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
      }
      ck_launch(down ? "moe_down (big jobs)" : "moe_gate_up (big jobs)");
-diff --git a/src/split/src/model.cpp b/src/split/src/model.cpp
+diff --git a/engine/src/split/src/model.cpp b/engine/src/split/src/model.cpp
 index b5dc85450..01009ebc5 100644
---- a/src/split/src/model.cpp
-+++ b/src/split/src/model.cpp
+--- a/engine/src/split/src/model.cpp
++++ b/engine/src/split/src/model.cpp
 @@ -6,9 +6,9 @@
  #include "rope_gguf.hpp"
  
@@ -485,10 +484,10 @@ index b5dc85450..01009ebc5 100644
  #endif
  // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
  template <typename F>
-diff --git a/src/split/src/model.hpp b/src/split/src/model.hpp
+diff --git a/engine/src/split/src/model.hpp b/engine/src/split/src/model.hpp
 index b41038ccb..fe0f96916 100644
---- a/src/split/src/model.hpp
-+++ b/src/split/src/model.hpp
+--- a/engine/src/split/src/model.hpp
++++ b/engine/src/split/src/model.hpp
 @@ -8,6 +8,7 @@
  #include <vector>
  
@@ -506,10 +505,10 @@ index b41038ccb..fe0f96916 100644
  struct ExpertCache {
      int n_slots = 0;                     // all pools'
      int n_pools = 0;
-diff --git a/src/split/src/qdot.cuh b/src/split/src/qdot.cuh
-index 211033cb5..5b1e9c329 100644
---- a/src/split/src/qdot.cuh
-+++ b/src/split/src/qdot.cuh
+diff --git a/engine/src/split/src/qdot.cuh b/engine/src/split/src/qdot.cuh
+index 2bbd2dc08..e591e149a 100644
+--- a/engine/src/split/src/qdot.cuh
++++ b/engine/src/split/src/qdot.cuh
 @@ -104,10 +104,12 @@ template <> struct qtraits<T_IQ4_XS>  { static constexpr int qk = QK_K;   static
  template <> struct qtraits<T_IQ3_S>   { static constexpr int qk = QK_K;   static constexpr int qi = QI3_S; };
  template <> struct qtraits<T_IQ3_XXS> { static constexpr int qk = QK_K;   static constexpr int qi = QI3_XXS; };
@@ -603,10 +602,10 @@ index 211033cb5..5b1e9c329 100644
  // The three i-quant dots below are the CUDA ones (__vcmpne4 / __vsub4 sign expansion); a HIP build runs iqdot_hip.cuh's fnx_ variants
  // instead and compiles these only as tools/iqdot_test.cu's reference.
  static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
-diff --git a/src/split/src/selftest.hpp b/src/split/src/selftest.hpp
+diff --git a/engine/src/split/src/selftest.hpp b/engine/src/split/src/selftest.hpp
 index e0a73317c..7353076ec 100644
---- a/src/split/src/selftest.hpp
-+++ b/src/split/src/selftest.hpp
+--- a/engine/src/split/src/selftest.hpp
++++ b/engine/src/split/src/selftest.hpp
 @@ -1,7 +1,9 @@
 -// The kernel self-test of a card (HIP only; selftest.cu, rules and lines in hip/selftest_policy.hpp).
 +// The kernel self-test of a card (selftest.cu; the HIP rules and lines in hip/selftest_policy.hpp, the NVIDIA ones in arch_caps.hpp).
@@ -618,10 +617,10 @@ index e0a73317c..7353076ec 100644
  namespace fnx {
  // runs the tests on device dev: "" when they all passed (covered: what ran, for the pass line), else the first failure in a few words
  std::string selftest_card(int dev, std::string& covered);
-diff --git a/src/split/src/tensor_convert.hpp b/src/split/src/tensor_convert.hpp
+diff --git a/engine/src/split/src/tensor_convert.hpp b/engine/src/split/src/tensor_convert.hpp
 index 6693c7a67..847500a25 100644
---- a/src/split/src/tensor_convert.hpp
-+++ b/src/split/src/tensor_convert.hpp
+--- a/engine/src/split/src/tensor_convert.hpp
++++ b/engine/src/split/src/tensor_convert.hpp
 @@ -16,6 +16,7 @@
  #include <vector>
  
@@ -680,11 +679,11 @@ index 6693c7a67..847500a25 100644
      case T_Q4_K:
          for (size_t b = 0; b < n / 256; ++b) {
              const uint8_t* p = src + b * 144;
-diff --git a/src/split/tools/arch_caps_test.cpp b/src/split/tools/arch_caps_test.cpp
+diff --git a/engine/src/split/tools/arch_caps_test.cpp b/engine/src/split/tools/arch_caps_test.cpp
 new file mode 100644
 index 000000000..fa7dccfe3
 --- /dev/null
-+++ b/src/split/tools/arch_caps_test.cpp
++++ b/engine/src/split/tools/arch_caps_test.cpp
 @@ -0,0 +1,81 @@
 +// CPU unit test of src/arch_caps.hpp: the shared-memory table against the published CUDA figures, the layout the
 +// kernels need against that table, and the self-test rule for a card Strata has not run the split on.  No GPU, no card.
@@ -767,32 +766,10 @@ index 000000000..fa7dccfe3
 +                (int) published.size(), floats(32), floats(16));
 +    return 0;
 +}
-diff --git a/src/split/tools/qdot_test.cu b/src/split/tools/qdot_test.cu
-index e4cfcb2b2..1037cc52f 100644
---- a/src/split/tools/qdot_test.cu
-+++ b/src/split/tools/qdot_test.cu
-@@ -60,6 +60,8 @@ FNX_QD_PAIR(T_IQ4_XS, vec_dot_iq4_xs_q8_1, VDR_IQ4_XS_Q8_1_MMVQ)
- FNX_QD_PAIR(T_IQ3_S, vec_dot_iq3_s_q8_1, VDR_IQ3_S_Q8_1_MMVQ)
- FNX_QD_PAIR(T_IQ3_XXS, vec_dot_iq3_xxs_q8_1, VDR_IQ3_XXS_Q8_1_MMVQ)
- FNX_QD_PAIR(T_IQ2_S, vec_dot_iq2_s_q8_1, VDR_IQ2_S_Q8_1_MMVQ)
-+FNX_QD_PAIR(T_IQ2_XS, vec_dot_iq2_xs_q8_1, VDR_IQ2_XS_Q8_1_MMVQ)
-+FNX_QD_PAIR(T_IQ2_XXS, vec_dot_iq2_xxs_q8_1, VDR_IQ2_XXS_Q8_1_MMVQ)
- 
- // one thread per (weight block, lane): the call the decode kernels make (kernels.cu k_mmvq: y + kbx * (qk / QK8_1), iqs = vdr * lane)
- template <GgmlType T>
-@@ -219,6 +221,8 @@ int main(int argc, char** argv) {
-     ok &= run<T_IQ3_S>("IQ3_S", sizeof(block_iq3_s), {0}, n, 9, VDR_IQ3_S);
-     ok &= run<T_IQ3_XXS>("IQ3_XXS", sizeof(block_iq3_xxs), {0}, n, 10, VDR_IQ3_XXS);
-     ok &= run<T_IQ2_S>("IQ2_S", sizeof(block_iq2_s), {0}, n, 11, VDR_IQ2_S);
-+    ok &= run<T_IQ2_XS>("IQ2_XS", sizeof(block_iq2_xs), {0}, n, 12, VDR_IQ2_XS);
-+    ok &= run<T_IQ2_XXS>("IQ2_XXS", sizeof(block_iq2_xxs), {0}, n, 13, VDR_IQ2_XXS);
-     std::printf(ok ? "qdot_test: PASS\n" : "qdot_test: FAIL\n");
-     return ok ? 0 : 1;
- }
-diff --git a/src/split/tools/selftest_main.cpp b/src/split/tools/selftest_main.cpp
+diff --git a/engine/src/split/tools/selftest_main.cpp b/engine/src/split/tools/selftest_main.cpp
 index 0288e5203..9e8c20966 100644
---- a/src/split/tools/selftest_main.cpp
-+++ b/src/split/tools/selftest_main.cpp
+--- a/engine/src/split/tools/selftest_main.cpp
++++ b/engine/src/split/tools/selftest_main.cpp
 @@ -1,7 +1,11 @@
 -// Standalone run of the engine's kernel self-test (src/selftest.cu) on one card: no model, no engine. Built by the optional CMake target strata-split-selftest
 -// (src/split/CMakeLists.txt; HIP only, off by default). Prints the card and the result; exit 0 when every test passed.
@@ -835,10 +812,10 @@ index 0288e5203..9e8c20966 100644
      std::string covered;
      const auto t0 = std::chrono::steady_clock::now();
      const std::string bad = fnx::selftest_card(dev, covered);
-diff --git a/strata_control/split_engine.py b/strata_control/split_engine.py
+diff --git a/terminal/strata_control/split_engine.py b/terminal/strata_control/split_engine.py
 index b395b7faa..f0b8b032c 100644
---- a/strata_control/split_engine.py
-+++ b/strata_control/split_engine.py
+--- a/terminal/strata_control/split_engine.py
++++ b/terminal/strata_control/split_engine.py
 @@ -12,7 +12,7 @@ has actually been run:
  
    - not turned off (mode(): "auto" by default; "on" is the same rule but a refusal is reported; "off" never);
@@ -1040,11 +1017,11 @@ index b395b7faa..f0b8b032c 100644
      cfg["split_fallback"] = {k: base[k] for k in ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting", "cwd") if k in base}
      # The split engine runs the model's own draft layer (the MTP) and nothing else. Saying so in the config ("drafting": "mtp") keeps serve/server.py's
      # drafter step, which resolves Auto to DFlash2 where the engine has it, from adding DFlash2 flags to the split engine's arguments (it would refuse them
-diff --git a/tests/split/test_arch_caps_parity.py b/tests/split/test_arch_caps_parity.py
+diff --git a/terminal/tests/split/test_arch_caps_parity.py b/terminal/tests/split/test_arch_caps_parity.py
 new file mode 100644
 index 000000000..659d3665f
 --- /dev/null
-+++ b/tests/split/test_arch_caps_parity.py
++++ b/terminal/tests/split/test_arch_caps_parity.py
 @@ -0,0 +1,70 @@
 +#!/usr/bin/env python3
 +# /// script
@@ -1116,10 +1093,10 @@ index 000000000..659d3665f
 +
 +if __name__ == "__main__":
 +    sys.exit(main())
-diff --git a/tests/split/test_split_engine.py b/tests/split/test_split_engine.py
-index 226631a22..ba5c1268a 100644
---- a/tests/split/test_split_engine.py
-+++ b/tests/split/test_split_engine.py
+diff --git a/terminal/tests/split/test_split_engine.py b/terminal/tests/split/test_split_engine.py
+index 0a0d7c3b4..3831477f8 100644
+--- a/terminal/tests/split/test_split_engine.py
++++ b/terminal/tests/split/test_split_engine.py
 @@ -2,6 +2,7 @@
  
  from __future__ import annotations
