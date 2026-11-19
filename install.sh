@@ -43,7 +43,10 @@ say() { printf '%s\n' "$*"; }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 [ -f "$PATCH" ] || fail "Patch fehlt: $PATCH"
-[ -f "$TREE/src/split/CMakeLists.txt" ] || fail "Kein Strata-Baum in $TREE (src/split/CMakeLists.txt fehlt). --baum angeben."
+# 0.2.16 (Layout-Move 4058aa782): der Engine-Baum liegt in engine/; aeltere Baeume haben ihn oben.
+if [ -f "$TREE/engine/src/split/CMakeLists.txt" ]; then SRC="$TREE/engine"
+elif [ -f "$TREE/src/split/CMakeLists.txt" ]; then SRC="$TREE"
+else fail "Kein Strata-Baum in $TREE (engine/src/split/CMakeLists.txt fehlt). --baum angeben."; fi
 command -v git >/dev/null || fail "git fehlt."
 
 cd "$TREE"
@@ -73,8 +76,9 @@ detect_cards() {
     return
   fi
   local cc; cc="$(printf '%s' "$caps" | tr -d '.')"
-  [ -z "$ARCH" ] && ARCH="$cc"
-  [ -z "$CARDS" ] && CARDS="$n"
+  # (set -e: ein nacktes [ -z ... ] && ... bricht das Skript ab, wenn die Option schon gesetzt war)
+  if [ -z "$ARCH" ]; then ARCH="$cc"; fi
+  if [ -z "$CARDS" ]; then CARDS="$n"; fi
 }
 detect_cards
 
@@ -82,7 +86,21 @@ if [ "$MODE" != "revert" ]; then
   [ -n "$ARCH" ] || fail "Keine Architektur ermittelt: --arch NN angeben (z.B. --arch 86)."
   [ -n "$CARDS" ] || fail "Keine Kartenanzahl ermittelt: --karten \"4\" angeben."
   case "$ARCH" in [0-9][0-9]) ;; *) fail "--arch muss zweistellig sein (86, 75, 90, 120), nicht $ARCH" ;; esac
+  case "$CARDS" in 2|3|4) ;; *) fail "Die Split-Engine baut fuer 2, 3 oder 4 Karten (CMake-Regel), nicht $CARDS. Auf einem Ein-Karten-Rechner nur ein Bau-Test: --karten 2 (zwei Karten braucht der Lauf trotzdem)." ;; esac
   say "Ziel:    sm_$ARCH mit Karten-Anzahlen \"$CARDS\""
+fi
+
+# ---------------- 0) zurueck ----------------
+# (vor jeder Pruefung: ein schon gepatchter Baum besteht die Vorwaerts-Pruefung nicht,
+#  darum darf --zurueck nicht hinter der Pruefung stehen)
+if [ "$MODE" = "revert" ]; then
+  say ""
+  say "== Patch zuruecknehmen =="
+  if git apply -R "$PATCH"; then say "     zurueckgenommen. Jetzt ist update.sh sicher."; exit 0; fi
+  say "     das Abnehmen meldet Fehler -- vermutlich liegt ein ANDERER (aelterer) Patch drauf."
+  say "     Deterministischer Weg: git checkout -- . und die Neudateien dieses Patches loeschen"
+  say "     (ihre Namen: grep '^+++ b/' $PATCH | sed 's|^+++ b/||')."
+  exit 1
 fi
 
 # ---------------- 1) pruefen ----------------
@@ -99,10 +117,6 @@ say "     konfliktfrei."
 # ---------------- 2) anwenden ----------------
 say ""
 say "== 2) Patch anwenden =="
-if [ "$MODE" = "revert" ]; then
-  git apply -R "$PATCH" && say "     zurueckgenommen. Jetzt ist update.sh sicher."
-  exit 0
-fi
 git apply "$PATCH" || fail "Anwenden fehlgeschlagen."
 say "     angewandt (nicht committet). Geaenderte Dateien:"
 git status --short | sed 's/^/     /'
@@ -119,7 +133,7 @@ NVCC="${CUDACXX:-}"
 BUILD_DIR="${BUILD_DIR:-$TREE/build-split4}"
 say "nvcc:    $NVCC"
 say "Build:   $BUILD_DIR"
-cmake -B "$BUILD_DIR" -S "$TREE" \
+cmake -B "$BUILD_DIR" -S "$SRC" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER="$NVCC" \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
