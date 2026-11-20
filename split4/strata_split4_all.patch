@@ -155,6 +155,29 @@ index 000000000..cde7e072b
 +}
 +
 +}  // namespace fnx
+diff --git a/engine/src/split/src/batch.cpp b/engine/src/split/src/batch.cpp
+index 9217e2677..02225540e 100644
+--- a/engine/src/split/src/batch.cpp
++++ b/engine/src/split/src/batch.cpp
+@@ -84,6 +84,18 @@ BatchDecoder::BatchDecoder(Engine& e, int K, int lookup_k, std::vector<int> eos,
+     horizon_ = (double) horizon;
+     if (e_.warm_capture_ms > 0.0) capture_ms_ = e_.warm_capture_ms;   // FNX_PRECAP: the capture's measured cost, not the default
+     trace_ = env_int("FNX_BATCH_TRACE", 0) != 0;
++    // RowCost's numbers are the lab card's (batch_plan.hpp: "Q4, lab, 2026-10-25").  A machine whose rows cost
++    // differently has no way to say so, and the plan then drafts past its own break-even.  Name them per install.
++    cost_.round_ms = env_num("FNX_BATCH_ROUND_MS", cost_.round_ms);
++    cost_.row_lo = env_num("FNX_BATCH_ROW_LO", cost_.row_lo);
++    cost_.row_hi = env_num("FNX_BATCH_ROW_HI", cost_.row_hi);
++    cost_.call_ms = env_num("FNX_BATCH_CALL_MS", cost_.call_ms);
++    cost_.chain_ms = env_num("FNX_BATCH_CHAIN_MS", cost_.chain_ms);
++    cost_.group_ms = env_num("FNX_BATCH_GROUP_MS", cost_.group_ms);
++    if (const long long k = env_int("FNX_BATCH_KNEE", cost_.knee); k >= 1 && k < MAXT) cost_.knee = (int) k;
++    if (std::getenv("FNX_BATCH_ROUND_MS") || std::getenv("FNX_BATCH_ROW_LO") || std::getenv("FNX_BATCH_ROW_HI"))
++        std::fprintf(stderr, "fnx: batch plan costs: round %.2f ms, a row %.2f to the %d'th then %.2f, call %.2f, chain %.2f, group %.2f\n",
++                     cost_.round_ms, cost_.row_lo, cost_.knee, cost_.row_hi, cost_.call_ms, cost_.chain_ms, cost_.group_ms);
+ }
+ 
+ bool BatchDecoder::is_eos(int t) const { return std::find(eos_.begin(), eos_.end(), t) != eos_.end(); }
 diff --git a/engine/src/split/src/gdn_prompt.cuh b/engine/src/split/src/gdn_prompt.cuh
 index 745c7e87a..a24cb8bbc 100644
 --- a/engine/src/split/src/gdn_prompt.cuh
@@ -198,10 +221,10 @@ index 745c7e87a..a24cb8bbc 100644
  constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_THREADS,
                GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
 diff --git a/engine/src/split/src/gguf.cpp b/engine/src/split/src/gguf.cpp
-index bf3da9d6a..69ac0b02b 100644
+index 1e4084603..9b37ce702 100644
 --- a/engine/src/split/src/gguf.cpp
 +++ b/engine/src/split/src/gguf.cpp
-@@ -35,6 +35,8 @@ TypeInfo type_info(uint32_t t) {
+@@ -39,6 +39,8 @@ TypeInfo type_info(uint32_t t) {
          case T_Q5_K: return {256, 176};
          case T_Q6_K: return {256, 210};
          case T_IQ4_NL: return {32, 18};
@@ -210,23 +233,25 @@ index bf3da9d6a..69ac0b02b 100644
          case T_IQ3_XXS: return {256, 98};
          case T_IQ3_S: return {256, 110};
          case T_IQ2_S: return {256, 82};
-@@ -123,13 +125,13 @@ void Gguf::convert_small_tensors() {
-     if (!mixed) return;
+@@ -146,12 +148,14 @@ void Gguf::convert_small_tensors() {
+     std::vector<Job> jobs;
      for (auto& kv : tensors_) {
          Tensor& t = kv.second;
 -        if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
 -            owned_.emplace_back();
+-            jobs.push_back({&t, 0, true, &owned_.back()});
 +        const uint32_t want = conv::wanted_type(t.name);
 +        if (t.type == T_Q2_0 && want == 0xFFFFFFFFu) {   // routed experts only: the same values as Q4_0 blocks.
 +            owned_.emplace_back();                        // A shared expert in Q2_0 must NOT take this shortcut: it needs Q8_0.
-             conv::repack_q2_0_to_q4_0(t, owned_.back());
-             ++converted_;
++            conv::repack_q2_0_to_q4_0(t, owned_.back());
++            ++converted_;
++
              continue;
          }
 -        const uint32_t want = conv::wanted_type(t.name);
          if (want == 0xFFFFFFFFu || want == t.type) continue;
          owned_.emplace_back();
-         conv::convert(t, want, owned_.back());
+         jobs.push_back({&t, want, false, &owned_.back()});
 diff --git a/engine/src/split/src/gguf.hpp b/engine/src/split/src/gguf.hpp
 index 2bd5efec6..a0b200df2 100644
 --- a/engine/src/split/src/gguf.hpp
@@ -617,6 +642,44 @@ index e0a73317c..7353076ec 100644
  namespace fnx {
  // runs the tests on device dev: "" when they all passed (covered: what ran, for the pass line), else the first failure in a few words
  std::string selftest_card(int dev, std::string& covered);
+diff --git a/engine/src/split/src/session.cpp b/engine/src/split/src/session.cpp
+index bef74165c..e1c22e0cf 100644
+--- a/engine/src/split/src/session.cpp
++++ b/engine/src/split/src/session.cpp
+@@ -414,14 +414,22 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
+     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
+     // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K
+     const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
+-    constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
++    // The costs above are the lab card's; on a machine whose rounds cost differently the chain has no way to say
++    // so and picks lengths past its own break-even.  Name them per install (measured: a round's base and the step
++    // a further verify row adds).
++    const double round_ms = env_num("FNX_DRAFT_ROUND_MS", 11.2), draft_row_ms = env_num("FNX_DRAFT_ROW_MS", 1.3),
++                 draft_call_ms = env_num("FNX_DRAFT_CALL_MS", 0.65);
++    constexpr double DECAY = 0.97;
++    if (std::getenv("FNX_DRAFT_ROUND_MS") || std::getenv("FNX_DRAFT_ROW_MS"))
++        std::fprintf(stderr, "fnx: draft chain costs: round %.2f ms, a verify row %.2f, a draft call %.2f\n",
++                     round_ms, draft_row_ms, draft_call_ms);
+     std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
+     auto chain_len = [&](double call_ms) {
+         int best = K_;
+         double best_rate = -1.0, expect = 1.0, reach = 1.0;
+         for (int k = 1; k <= K_; ++k) {   // at least d1: its acceptance stays measured (it pays above ~8% anyway)
+             reach *= stood[(size_t) k - 1] / tried[(size_t) k - 1], expect += reach;
+-            const double rate = expect / (ROUND_MS + k * DRAFT_ROW_MS + std::max(0, k - 1) * call_ms);
++            const double rate = expect / (round_ms + k * draft_row_ms + std::max(0, k - 1) * call_ms);
+             if (rate > best_rate) best_rate = rate, best = k;
+         }
+         return best;
+@@ -608,7 +616,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
+         // the MTP chain: each draft from the draft layer's own row for the one before
+         // every 4th chain one draft longer, so the position past the chosen length stays measured (the full K every 4th
+         // chain cost prose ~0.9 ms a round)
+-        const int k = !adapt ? K_ : std::min(K_, chain_len(DRAFT_CALL_MS) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
++        const int k = !adapt ? K_ : std::min(K_, chain_len(draft_call_ms) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
+         mtp_round = true;
+         drafts = {d1}, qs = {std::move(q1)};
+         for (int j = 1; j < k; ++j) {
 diff --git a/engine/src/split/src/tensor_convert.hpp b/engine/src/split/src/tensor_convert.hpp
 index 6693c7a67..847500a25 100644
 --- a/engine/src/split/src/tensor_convert.hpp
@@ -812,6 +875,35 @@ index 0288e5203..9e8c20966 100644
      std::string covered;
      const auto t0 = std::chrono::steady_clock::now();
      const std::string bad = fnx::selftest_card(dev, covered);
+diff --git a/engine/src/split/tools/sfnx.cpp b/engine/src/split/tools/sfnx.cpp
+index e4fdd124e..0c5dc229d 100644
+--- a/engine/src/split/tools/sfnx.cpp
++++ b/engine/src/split/tools/sfnx.cpp
+@@ -860,6 +860,24 @@ struct Server {
+                      slot, st.prompt_tokens, st.reused, st.prompt_tokens - st.reused, st.prompt_ms, st.generated, st.decode_ms,
+                      st.generated * 1000.0 / std::max(1.0, st.decode_ms), st.drafts_accepted, st.drafts_offered, st.rounds, st.lookup_rounds,
+                      st.decode_ms / std::max(1, st.rounds));
++        // FNX_BATCH_DEPTH_STATS=1: the acceptance the lane actually measured, per draft position (decayed, as the
++        // plan reads it).  A position whose share falls under what one more row costs is the plan's own cut-off point.
++        if (fnx::env_flag("FNX_BATCH_DEPTH_STATS")) {
++            const auto& bl = slots[(size_t) slot].bl;
++            const auto show = [this, slot](const char* tag, const std::vector<double>& tried, const std::vector<double>& stood) {
++                std::string s;
++                for (int j = 0; j < (int) tried.size(); ++j)
++                    if (tried[(size_t) j] > 1.0) {
++                        char b[48];
++                        std::snprintf(b, sizeof b, " %d:%.2f", j + 1, stood[(size_t) j] / tried[(size_t) j]);
++                        s += b;
++                    }
++                if (!s.empty())
++                    std::fprintf(stderr, "sfnx: slot %d acceptance%s by draft position:%s\n", slot, tag, s.c_str());
++            };
++            show(" chain", bl.tried, bl.stood);
++            show(" lookup", bl.lk_tried, bl.lk_stood);
++        }
+         slots[(size_t) slot].idle_since = std::chrono::steady_clock::now();
+         save_routes();
+     }
 diff --git a/terminal/strata_control/split_engine.py b/terminal/strata_control/split_engine.py
 index b395b7faa..f0b8b032c 100644
 --- a/terminal/strata_control/split_engine.py
@@ -1017,82 +1109,6 @@ index b395b7faa..f0b8b032c 100644
      cfg["split_fallback"] = {k: base[k] for k in ("exe", "args", "env", "layer_split", "replicas", "user_args", "drafting", "cwd") if k in base}
      # The split engine runs the model's own draft layer (the MTP) and nothing else. Saying so in the config ("drafting": "mtp") keeps serve/server.py's
      # drafter step, which resolves Auto to DFlash2 where the engine has it, from adding DFlash2 flags to the split engine's arguments (it would refuse them
-diff --git a/terminal/tests/split/test_arch_caps_parity.py b/terminal/tests/split/test_arch_caps_parity.py
-new file mode 100644
-index 000000000..659d3665f
---- /dev/null
-+++ b/terminal/tests/split/test_arch_caps_parity.py
-@@ -0,0 +1,70 @@
-+#!/usr/bin/env python3
-+# /// script
-+# requires-python = ">=3.12"
-+# ///
-+"""Hält die zwei Shared-Memory-Tabellen zusammen: die des Engine-Codes (src/split/src/arch_caps.hpp) und die der
-+Kartenregel (strata_control/split_engine.py). Bewiesen wird über den Compiler, nicht über eingelesenen Text --
-+ein kleines C++-Programm gegen den Header ausgedruckt und Zahl für Zahl gegen shared_mem_kib() gehalten.
-+
-+    python3 tests/split/test_arch_caps_parity.py
-+"""
-+import pathlib
-+import subprocess
-+import sys
-+import tempfile
-+
-+ROOT = pathlib.Path(__file__).resolve().parents[2]
-+sys.path.insert(0, str(ROOT))
-+from strata_control import split_engine as SE                     # noqa: E402
-+
-+CCS = [61, 70, 75, 80, 86, 87, 89, 90, 100, 103, 110, 120, 121, 130, 135]
-+
-+CPP = """
-+#include "arch_caps.hpp"
-+#include <cstdio>
-+int main() {
-+    const int ccs[] = {%s};
-+    for (int cc : ccs) printf("%%d:%%d\\n", cc, fnx::smem_per_block_kib(cc));
-+    return 0;
-+}
-+""" % ", ".join(str(c) for c in CCS)
-+
-+
-+def main() -> int:
-+    with tempfile.TemporaryDirectory() as td:
-+        src = pathlib.Path(td) / "probe.cpp"
-+        exe = pathlib.Path(td) / "probe"
-+        src.write_text(CPP, encoding="utf-8")
-+        build = subprocess.run(["g++", "-std=c++17", f"-I{ROOT / 'src/split/src'}", str(src), "-o", str(exe)],
-+                               capture_output=True, text=True)
-+        if build.returncode != 0:
-+            print("arch_caps.hpp ließ sich nicht bauen:\n" + build.stderr)
-+            return 1
-+        out = subprocess.run([str(exe)], capture_output=True, text=True)
-+        if out.returncode != 0:
-+            print("Der C++-Ausdruck lief nicht:\n" + out.stderr)
-+            return 1
-+        cpp = {int(a): int(b) for a, b in (line.split(":") for line in out.stdout.split())}
-+
-+    bad = 0
-+    for cc in CCS:
-+        py = SE.shared_mem_kib(f"sm_{cc}")
-+        mark = "ok" if py == cpp[cc] else "ANDERS"
-+        if py != cpp[cc]:
-+            bad += 1
-+        print(f"  sm_{cc:<4} C++ {cpp[cc]:>4} KiB   Python {py:>4} KiB   {mark}")
-+    # die Layout-Entscheidung selbst: ab welcher Karte passen 32 Spalten?
-+    wide_cpp = [cc for cc in CCS if cpp[cc] * 1024 >= 74372]
-+    wide_py = [cc for cc in CCS if SE.shared_mem_kib(f"sm_{cc}") * 1024 >= SE.PROMPT_LAYOUT_KIB * 1024]
-+    if wide_cpp != wide_py:
-+        bad += 1
-+        print(f"  Layout-Schwelle ANDERS: C++ {wide_cpp}, Python {wide_py}")
-+    if bad:
-+        print(f"arch_caps-Parität: {bad} Abweichungen")
-+        return 1
-+    print(f"arch_caps-Parität: alle {len(CCS)} Stufen gleich (32 Spalten ab {wide_cpp[0]}, darunter 16)")
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
 diff --git a/terminal/tests/split/test_split_engine.py b/terminal/tests/split/test_split_engine.py
 index 0a0d7c3b4..3831477f8 100644
 --- a/terminal/tests/split/test_split_engine.py
